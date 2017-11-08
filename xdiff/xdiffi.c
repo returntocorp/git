@@ -549,6 +549,7 @@ int xdl_build_script(xdfenv_t *xe, xdchange_t **xscr) {
 			for (l1 = i1; rchg1[i1 - 1]; i1--);
 			for (l2 = i2; rchg2[i2 - 1]; i2--);
 
+            printf("{{jgit change}}:%ld,%ld,%ld,%ld\n", i1, l1, i2, l2);
 			if (!(xch = xdl_add_change(cscr, i1, i2, l1 - i1, l2 - i2))) {
 				xdl_free_script(cscr);
 				return -1;
