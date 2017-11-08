@@ -137,7 +137,9 @@ static void create_pack_file(void)
 		argv_array_push(&pack_objects.args, "--delta-base-offset");
 	if (use_include_tag)
 		argv_array_push(&pack_objects.args, "--include-tag");
-	arg_format_list_objects_filter(&pack_objects.args, &filter_options);
+	if (filter_options.choice)
+		argv_array_pushf(&pack_objects.args, "--%s=%s",
+				 CL_ARG__FILTER, filter_options.raw_value);
 
 	pack_objects.in = -1;
 	pack_objects.out = -1;
