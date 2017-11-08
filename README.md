@@ -1,3 +1,7 @@
+build on osx with 
+
+    NO_GETTEXT=1 make CFLAGS="-g -fno-omit-frame-pointer -I/usr/local/opt/openssl/include" LDFLAGS="-L/usr/local/opt/openssl/lib"
+
 Git - fast, scalable, distributed revision control system
 =========================================================
 
