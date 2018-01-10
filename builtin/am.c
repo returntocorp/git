@@ -708,6 +708,7 @@ static int split_mail_mbox(struct am_state *state, const char **paths,
 {
 	struct child_process cp = CHILD_PROCESS_INIT;
 	struct strbuf last = STRBUF_INIT;
+	int ret;
 
 	cp.git_cmd = 1;
 	argv_array_push(&cp.args, "mailsplit");
@@ -721,13 +722,16 @@ static int split_mail_mbox(struct am_state *state, const char **paths,
 	argv_array_push(&cp.args, "--");
 	argv_array_pushv(&cp.args, paths);
 
-	if (capture_command(&cp, &last, 8))
-		return -1;
+	ret = capture_command(&cp, &last, 8);
+	if (ret)
+		goto exit;
 
 	state->cur = 1;
 	state->last = strtol(last.buf, NULL, 10);
 
-	return 0;
+exit:
+	strbuf_release(&last);
+	return ret ? -1 : 0;
 }
 
 /**
@@ -1143,43 +1147,6 @@ static void refresh_and_write_cache(void)
 }
 
 /**
- * Returns 1 if the index differs from HEAD, 0 otherwise. When on an unborn
- * branch, returns 1 if there are entries in the index, 0 otherwise. If an
- * strbuf is provided, the space-separated list of files that differ will be
- * appended to it.
- */
-static int index_has_changes(struct strbuf *sb)
-{
-	struct object_id head;
-	int i;
-
-	if (!get_oid_tree("HEAD", &head)) {
-		struct diff_options opt;
-
-		diff_setup(&opt);
-		DIFF_OPT_SET(&opt, EXIT_WITH_STATUS);
-		if (!sb)
-			DIFF_OPT_SET(&opt, QUICK);
-		do_diff_cache(&head, &opt);
-		diffcore_std(&opt);
-		for (i = 0; sb && i < diff_queued_diff.nr; i++) {
-			if (i)
-				strbuf_addch(sb, ' ');
-			strbuf_addstr(sb, diff_queued_diff.queue[i]->two->path);
-		}
-		diff_flush(&opt);
-		return DIFF_OPT_TST(&opt, HAS_CHANGES) != 0;
-	} else {
-		for (i = 0; sb && i < active_nr; i++) {
-			if (i)
-				strbuf_addch(sb, ' ');
-			strbuf_addstr(sb, active_cache[i]->name);
-		}
-		return !!active_nr;
-	}
-}
-
-/**
  * Dies with a user-friendly message on how to proceed after resolving the
  * problem. This message can be overridden with state->resolvemsg.
  */
@@ -1409,8 +1376,8 @@ static void write_commit_patch(const struct am_state *state, struct commit *comm
 	rev_info.show_root_diff = 1;
 	rev_info.diffopt.output_format = DIFF_FORMAT_PATCH;
 	rev_info.no_commit_id = 1;
-	DIFF_OPT_SET(&rev_info.diffopt, BINARY);
-	DIFF_OPT_SET(&rev_info.diffopt, FULL_INDEX);
+	rev_info.diffopt.flags.binary = 1;
+	rev_info.diffopt.flags.full_index = 1;
 	rev_info.diffopt.use_color = 0;
 	rev_info.diffopt.file = fp;
 	rev_info.diffopt.close_file = 1;
@@ -1433,7 +1400,7 @@ static void write_index_patch(const struct am_state *state)
 	if (!get_oid_tree("HEAD", &head))
 		tree = lookup_tree(&head);
 	else
-		tree = lookup_tree(&empty_tree_oid);
+		tree = lookup_tree(the_hash_algo->empty_tree);
 
 	fp = xfopen(am_path(state, "patch"), "w");
 	init_revisions(&rev_info, NULL);
@@ -2148,7 +2115,7 @@ static void am_abort(struct am_state *state)
 			   has_curr_head ? &curr_head : NULL, 0,
 			   UPDATE_REFS_DIE_ON_ERR);
 	else if (curr_branch)
-		delete_ref(NULL, curr_branch, NULL, REF_NODEREF);
+		delete_ref(NULL, curr_branch, NULL, REF_NO_DEREF);
 
 	free(curr_branch);
 	am_destroy(state);

@@ -377,7 +377,8 @@ static void shortlog(const char *name,
 			string_list_append(&subjects,
 					   oid_to_hex(&commit->object.oid));
 		else
-			string_list_append(&subjects, strbuf_detach(&sb, NULL));
+			string_list_append_nodup(&subjects,
+						 strbuf_detach(&sb, NULL));
 	}
 
 	if (opts->credit_people)
@@ -571,7 +572,7 @@ static void find_merge_parents(struct merge_parents *result,
 	head_commit = lookup_commit(head);
 	if (head_commit)
 		commit_list_insert(head_commit, &parents);
-	parents = reduce_heads(parents);
+	reduce_heads_replace(&parents);
 
 	while (parents) {
 		struct commit *cmit = pop_commit(&parents);

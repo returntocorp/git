@@ -1,6 +1,6 @@
 #!/bin/sh
 
-USAGE='[help|start|bad|good|new|old|terms|skip|next|reset|visualize|replay|log|run]'
+USAGE='[help|start|bad|good|new|old|terms|skip|next|reset|visualize|view|replay|log|run]'
 LONG_USAGE='git bisect help
 	print this long help message.
 git bisect start [--term-{old,good}=<term> --term-{new,bad}=<term>]
@@ -20,7 +20,7 @@ git bisect next
 	find next bisection to test and check it out.
 git bisect reset [<commit>]
 	finish bisection search and go back to commit.
-git bisect visualize
+git bisect (visualize|view)
 	show bisect status in gitk.
 git bisect replay <logfile>
 	replay bisection log.
@@ -449,6 +449,8 @@ bisect_replay () {
 
 bisect_run () {
 	bisect_next_check fail
+
+	test -n "$*" || die "$(gettext "bisect run failed: no command provided.")"
 
 	while true
 	do

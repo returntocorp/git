@@ -12,7 +12,7 @@
 #include "lockfile.h"
 #include "tag.h"
 #include "object.h"
-#include "commit.h"
+#include "pretty.h"
 #include "run-command.h"
 #include "refs.h"
 #include "diff.h"
@@ -166,7 +166,7 @@ static int read_from_tree(const struct pathspec *pathspec,
 	opt.output_format = DIFF_FORMAT_CALLBACK;
 	opt.format_callback = update_index_from_diff;
 	opt.format_callback_data = &intent_to_add;
-	opt.flags |= DIFF_OPT_OVERRIDE_SUBMODULE_CONFIG;
+	opt.flags.override_submodule_config = 1;
 
 	if (do_diff_cache(tree_oid, &opt))
 		return 1;

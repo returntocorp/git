@@ -567,6 +567,8 @@ static int git_merge_config(const char *k, const char *v, void *cb)
 
 	if (!strcmp(k, "merge.diffstat") || !strcmp(k, "merge.stat"))
 		show_diffstat = git_config_bool(k, v);
+	else if (!strcmp(k, "merge.verifysignatures"))
+		verify_signatures = git_config_bool(k, v);
 	else if (!strcmp(k, "pull.twohead"))
 		return git_config_string(&pull_twohead, k, v);
 	else if (!strcmp(k, "pull.octopus"))
@@ -998,6 +1000,7 @@ static struct commit_list *reduce_parents(struct commit *head_commit,
 
 	/* Find what parents to record by checking independent ones. */
 	parents = reduce_heads(remoteheads);
+	free_commit_list(remoteheads);
 
 	remoteheads = NULL;
 	remotes = &remoteheads;

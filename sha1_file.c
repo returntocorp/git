@@ -39,6 +39,64 @@ const struct object_id empty_blob_oid = {
 	EMPTY_BLOB_SHA1_BIN_LITERAL
 };
 
+static void git_hash_sha1_init(void *ctx)
+{
+	git_SHA1_Init((git_SHA_CTX *)ctx);
+}
+
+static void git_hash_sha1_update(void *ctx, const void *data, size_t len)
+{
+	git_SHA1_Update((git_SHA_CTX *)ctx, data, len);
+}
+
+static void git_hash_sha1_final(unsigned char *hash, void *ctx)
+{
+	git_SHA1_Final(hash, (git_SHA_CTX *)ctx);
+}
+
+static void git_hash_unknown_init(void *ctx)
+{
+	die("trying to init unknown hash");
+}
+
+static void git_hash_unknown_update(void *ctx, const void *data, size_t len)
+{
+	die("trying to update unknown hash");
+}
+
+static void git_hash_unknown_final(unsigned char *hash, void *ctx)
+{
+	die("trying to finalize unknown hash");
+}
+
+const struct git_hash_algo hash_algos[GIT_HASH_NALGOS] = {
+	{
+		NULL,
+		0x00000000,
+		0,
+		0,
+		0,
+		git_hash_unknown_init,
+		git_hash_unknown_update,
+		git_hash_unknown_final,
+		NULL,
+		NULL,
+	},
+	{
+		"sha-1",
+		/* "sha1", big-endian */
+		0x73686131,
+		sizeof(git_SHA_CTX),
+		GIT_SHA1_RAWSZ,
+		GIT_SHA1_HEXSZ,
+		git_hash_sha1_init,
+		git_hash_sha1_update,
+		git_hash_sha1_final,
+		&empty_tree_oid,
+		&empty_blob_oid,
+	},
+};
+
 /*
  * This is meant to hold a *small* number of objects that you would
  * want read_sha1_file() to be able to return, but yet you do not want
@@ -73,6 +131,18 @@ static struct cached_object *find_cached_object(const unsigned char *sha1)
 		return &empty_tree;
 	return NULL;
 }
+
+
+static enum safe_crlf get_safe_crlf(unsigned flags)
+{
+	if (flags & HASH_RENORMALIZE)
+		return SAFE_CRLF_RENORMALIZE;
+	else if (flags & HASH_WRITE_OBJECT)
+		return safe_crlf;
+	else
+		return SAFE_CRLF_FALSE;
+}
+
 
 int mkdir_in_gitdir(const char *path)
 {
@@ -404,6 +474,9 @@ static void link_alt_odb_entries(const char *alt, int sep,
 	struct strbuf objdirbuf = STRBUF_INIT;
 	struct strbuf entry = STRBUF_INIT;
 
+	if (!alt || !*alt)
+		return;
+
 	if (depth > 5) {
 		error("%s: ignoring alternate object stores, nesting too deep.",
 				relative_base);
@@ -604,7 +677,6 @@ void prepare_alt_odb(void)
 		return;
 
 	alt = getenv(ALTERNATE_DB_ENVIRONMENT);
-	if (!alt) alt = "";
 
 	alt_odb_tail = &alt_odb_list;
 	link_alt_odb_entries(alt, PATH_SEP, NULL, 0);
@@ -1150,6 +1222,9 @@ int sha1_object_info_extended(const unsigned char *sha1, struct object_info *oi,
 				    lookup_replace_object(sha1) :
 				    sha1;
 
+	if (is_null_sha1(real))
+		return -1;
+
 	if (!oi)
 		oi = &blank_oi;
 
@@ -1677,7 +1752,7 @@ static int index_mem(struct object_id *oid, void *buf, size_t size,
 	if ((type == OBJ_BLOB) && path) {
 		struct strbuf nbuf = STRBUF_INIT;
 		if (convert_to_git(&the_index, path, buf, size, &nbuf,
-				   write_object ? safe_crlf : SAFE_CRLF_FALSE)) {
+				   get_safe_crlf(flags))) {
 			buf = strbuf_detach(&nbuf, &size);
 			re_allocated = 1;
 		}
@@ -1711,7 +1786,7 @@ static int index_stream_convert_blob(struct object_id *oid, int fd,
 	assert(would_convert_to_git_filter_fd(path));
 
 	convert_to_git_filter_fd(&the_index, path, fd, &sbuf,
-				 write_object ? safe_crlf : SAFE_CRLF_FALSE);
+				 get_safe_crlf(flags));
 
 	if (write_object)
 		ret = write_sha1_file(sbuf.buf, sbuf.len, typename(OBJ_BLOB),
@@ -1881,6 +1956,7 @@ int for_each_file_in_obj_subdir(unsigned int subdir_nr,
 	DIR *dir;
 	struct dirent *de;
 	int r = 0;
+	struct object_id oid;
 
 	if (subdir_nr > 0xff)
 		BUG("invalid loose object subdirectory: %x", subdir_nr);
@@ -1888,7 +1964,6 @@ int for_each_file_in_obj_subdir(unsigned int subdir_nr,
 	origlen = path->len;
 	strbuf_complete(path, '/');
 	strbuf_addf(path, "%02x", subdir_nr);
-	baselen = path->len;
 
 	dir = opendir(path->buf);
 	if (!dir) {
@@ -1898,27 +1973,27 @@ int for_each_file_in_obj_subdir(unsigned int subdir_nr,
 		return r;
 	}
 
+	oid.hash[0] = subdir_nr;
+	strbuf_addch(path, '/');
+	baselen = path->len;
+
 	while ((de = readdir(dir))) {
+		size_t namelen;
 		if (is_dot_or_dotdot(de->d_name))
 			continue;
 
+		namelen = strlen(de->d_name);
 		strbuf_setlen(path, baselen);
-		strbuf_addf(path, "/%s", de->d_name);
-
-		if (strlen(de->d_name) == GIT_SHA1_HEXSZ - 2)  {
-			char hex[GIT_MAX_HEXSZ+1];
-			struct object_id oid;
-
-			xsnprintf(hex, sizeof(hex), "%02x%s",
-				  subdir_nr, de->d_name);
-			if (!get_oid_hex(hex, &oid)) {
-				if (obj_cb) {
-					r = obj_cb(&oid, path->buf, data);
-					if (r)
-						break;
-				}
-				continue;
+		strbuf_add(path, de->d_name, namelen);
+		if (namelen == GIT_SHA1_HEXSZ - 2 &&
+		    !hex_to_bytes(oid.hash + 1, de->d_name,
+				  GIT_SHA1_RAWSZ - 1)) {
+			if (obj_cb) {
+				r = obj_cb(&oid, path->buf, data);
+				if (r)
+					break;
 			}
+			continue;
 		}
 
 		if (cruft_cb) {
@@ -1929,7 +2004,7 @@ int for_each_file_in_obj_subdir(unsigned int subdir_nr,
 	}
 	closedir(dir);
 
-	strbuf_setlen(path, baselen);
+	strbuf_setlen(path, baselen - 1);
 	if (!r && subdir_cb)
 		r = subdir_cb(subdir_nr, path->buf, data);
 

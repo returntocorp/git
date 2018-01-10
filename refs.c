@@ -242,6 +242,50 @@ int ref_exists(const char *refname)
 	return !!resolve_ref_unsafe(refname, RESOLVE_REF_READING, NULL, NULL);
 }
 
+static int match_ref_pattern(const char *refname,
+			     const struct string_list_item *item)
+{
+	int matched = 0;
+	if (item->util == NULL) {
+		if (!wildmatch(item->string, refname, 0))
+			matched = 1;
+	} else {
+		const char *rest;
+		if (skip_prefix(refname, item->string, &rest) &&
+		    (!*rest || *rest == '/'))
+			matched = 1;
+	}
+	return matched;
+}
+
+int ref_filter_match(const char *refname,
+		     const struct string_list *include_patterns,
+		     const struct string_list *exclude_patterns)
+{
+	struct string_list_item *item;
+
+	if (exclude_patterns && exclude_patterns->nr) {
+		for_each_string_list_item(item, exclude_patterns) {
+			if (match_ref_pattern(refname, item))
+				return 0;
+		}
+	}
+
+	if (include_patterns && include_patterns->nr) {
+		int found = 0;
+		for_each_string_list_item(item, include_patterns) {
+			if (match_ref_pattern(refname, item)) {
+				found = 1;
+				break;
+			}
+		}
+
+		if (!found)
+			return 0;
+	}
+	return 1;
+}
+
 static int filter_refs(const char *refname, const struct object_id *oid,
 			   int flags, void *data)
 {
@@ -367,6 +411,27 @@ int head_ref_namespaced(each_ref_fn fn, void *cb_data)
 	strbuf_release(&buf);
 
 	return ret;
+}
+
+void normalize_glob_ref(struct string_list_item *item, const char *prefix,
+			const char *pattern)
+{
+	struct strbuf normalized_pattern = STRBUF_INIT;
+
+	if (*pattern == '/')
+		BUG("pattern must not start with '/'");
+
+	if (prefix) {
+		strbuf_addstr(&normalized_pattern, prefix);
+	}
+	else if (!starts_with(pattern, "refs/"))
+		strbuf_addstr(&normalized_pattern, "refs/");
+	strbuf_addstr(&normalized_pattern, pattern);
+	strbuf_strip_suffix(&normalized_pattern, "/");
+
+	item->string = strbuf_detach(&normalized_pattern, NULL);
+	item->util = has_glob_specials(pattern) ? NULL : item->string;
+	strbuf_release(&normalized_pattern);
 }
 
 int for_each_glob_ref_in(each_ref_fn fn, const char *pattern,
@@ -770,7 +835,7 @@ static int read_ref_at_ent(struct object_id *ooid, struct object_id *noid,
 		if (cb->cutoff_cnt)
 			*cb->cutoff_cnt = cb->reccnt - 1;
 		/*
-		 * we have not yet updated cb->[n|o]sha1 so they still
+		 * we have not yet updated cb->[n|o]oid so they still
 		 * hold the values for the previous record.
 		 */
 		if (!is_null_oid(&cb->ooid)) {
@@ -906,9 +971,6 @@ struct ref_update *ref_transaction_add_update(
 	if (transaction->state != REF_TRANSACTION_OPEN)
 		die("BUG: update called for transaction that is not open");
 
-	if ((flags & REF_ISPRUNING) && !(flags & REF_NODEREF))
-		die("BUG: REF_ISPRUNING set without REF_NODEREF");
-
 	FLEX_ALLOC_STR(update, refname, refname);
 	ALLOC_GROW(transaction->updates, transaction->nr + 1, transaction->alloc);
 	transaction->updates[transaction->nr++] = update;
@@ -940,7 +1002,8 @@ int ref_transaction_update(struct ref_transaction *transaction,
 		return -1;
 	}
 
-	flags &= REF_TRANSACTION_UPDATE_ALLOWED_FLAGS;
+	if (flags & ~REF_TRANSACTION_UPDATE_ALLOWED_FLAGS)
+		BUG("illegal flags 0x%x passed to ref_transaction_update()", flags);
 
 	flags |= (new_oid ? REF_HAVE_NEW : 0) | (old_oid ? REF_HAVE_OLD : 0);
 
