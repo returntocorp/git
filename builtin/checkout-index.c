@@ -5,6 +5,7 @@
  *
  */
 #include "builtin.h"
+#include "config.h"
 #include "lockfile.h"
 #include "quote.h"
 #include "cache-tree.h"
@@ -16,7 +17,7 @@ static int checkout_stage; /* default to checkout stage0 */
 static int to_tempfile;
 static char topath[4][TEMPORARY_FILENAME_LENGTH + 1];
 
-static struct checkout state;
+static struct checkout state = CHECKOUT_INIT;
 
 static void write_tempfile_record(const char *name, const char *prefix)
 {
@@ -128,8 +129,6 @@ static const char * const builtin_checkout_index_usage[] = {
 	NULL
 };
 
-static struct lock_file lock_file;
-
 static int option_parse_stage(const struct option *opt,
 			      const char *arg, int unset)
 {
@@ -149,7 +148,7 @@ static int option_parse_stage(const struct option *opt,
 int cmd_checkout_index(int argc, const char **argv, const char *prefix)
 {
 	int i;
-	int newfd = -1;
+	struct lock_file lock_file = LOCK_INIT;
 	int all = 0;
 	int read_from_stdin = 0;
 	int prefix_length;
@@ -205,7 +204,7 @@ int cmd_checkout_index(int argc, const char **argv, const char *prefix)
 	if (index_opt && !state.base_dir_len && !to_tempfile) {
 		state.refresh_cache = 1;
 		state.istate = &the_index;
-		newfd = hold_locked_index(&lock_file, 1);
+		hold_locked_index(&lock_file, LOCK_DIE_ON_ERROR);
 	}
 
 	/* Check out named files first */
@@ -250,7 +249,7 @@ int cmd_checkout_index(int argc, const char **argv, const char *prefix)
 	if (all)
 		checkout_all(prefix, prefix_length);
 
-	if (0 <= newfd &&
+	if (is_lock_file_locked(&lock_file) &&
 	    write_locked_index(&the_index, &lock_file, COMMIT_LOCK))
 		die("Unable to write new index file");
 	return 0;

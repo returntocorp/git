@@ -4,12 +4,6 @@ test_description='CRLF conversion all combinations'
 
 . ./test-lib.sh
 
-if ! test_have_prereq EXPENSIVE
-then
-	skip_all="EXPENSIVE not set"
-	test_done
-fi
-
 compare_files () {
 	tr '\015\000' QN <"$1" >"$1".expect &&
 	tr '\015\000' QN <"$2" | tr -d 'Z' >"$2".actual &&
@@ -75,7 +69,7 @@ check_warning () {
 	*) echo >&2 "Illegal 1": "$1" ; return false ;;
 	esac
 	grep "will be replaced by" "$2" | sed -e "s/\(.*\) in [^ ]*$/\1/" | uniq  >"$2".actual
-	test_cmp "$2".expect "$2".actual
+	test_i18ncmp "$2".expect "$2".actual
 }
 
 commit_check_warn () {
@@ -119,8 +113,7 @@ commit_chk_wrnNNO () {
 		fname=${pfx}_$f.txt &&
 		cp $f $fname &&
 		printf Z >>"$fname" &&
-		git -c core.autocrlf=$crlf add $fname 2>/dev/null &&
-		git -c core.autocrlf=$crlf commit -m "commit_$fname" $fname >"${pfx}_$f.err" 2>&1
+		git -c core.autocrlf=$crlf add $fname 2>"${pfx}_$f.err"
 	done
 
 	test_expect_success "commit NNO files crlf=$crlf attr=$attr LF" '
@@ -322,7 +315,7 @@ test_expect_success 'setup master' '
 	echo >.gitattributes &&
 	git checkout -b master &&
 	git add .gitattributes &&
-	git commit -m "add .gitattributes" "" &&
+	git commit -m "add .gitattributes" . &&
 	printf "\$Id: 0000000000000000000000000000000000000000 \$\nLINEONE\nLINETWO\nLINETHREE"     >LF &&
 	printf "\$Id: 0000000000000000000000000000000000000000 \$\r\nLINEONE\r\nLINETWO\r\nLINETHREE" >CRLF &&
 	printf "\$Id: 0000000000000000000000000000000000000000 \$\nLINEONE\r\nLINETWO\nLINETHREE"   >CRLF_mix_LF &&
@@ -417,7 +410,8 @@ commit_chk_wrnNNO "text"  ""      false   "$WILC"   "$WICL"   "$WAMIX"    "$WILC
 commit_chk_wrnNNO "text"  ""      true    LF_CRLF   ""        LF_CRLF     LF_CRLF     ""
 commit_chk_wrnNNO "text"  ""      input   ""        CRLF_LF   CRLF_LF     ""          CRLF_LF
 
-test_expect_success 'create files cleanup' '
+test_expect_success 'commit NNO and cleanup' '
+	git commit -m "commit files on top of NNO" &&
 	rm -f *.txt &&
 	git -c core.autocrlf=false reset --hard
 '

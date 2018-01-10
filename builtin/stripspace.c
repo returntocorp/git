@@ -1,5 +1,6 @@
 #include "builtin.h"
 #include "cache.h"
+#include "config.h"
 #include "parse-options.h"
 #include "strbuf.h"
 
@@ -44,8 +45,10 @@ int cmd_stripspace(int argc, const char **argv, const char *prefix)
 	if (argc)
 		usage_with_options(stripspace_usage, options);
 
-	if (mode == STRIP_COMMENTS || mode == COMMENT_LINES)
+	if (mode == STRIP_COMMENTS || mode == COMMENT_LINES) {
+		setup_git_directory_gently(NULL);
 		git_config(git_default_config, NULL);
+	}
 
 	if (strbuf_read(&buf, 0, 1024) < 0)
 		die_errno("could not read the input");

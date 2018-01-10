@@ -9,7 +9,7 @@ git-repack - Pack unpacked objects in a repository
 SYNOPSIS
 --------
 [verse]
-'git repack' [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q] [-b] [--window=<n>] [--depth=<n>]
+'git repack' [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q] [-b] [--window=<n>] [--depth=<n>] [--threads=<n>]
 
 DESCRIPTION
 -----------
@@ -92,6 +92,9 @@ other objects in that pack they already have locally.
 	to be applied that many times to get to the necessary object.
 	The default value for --window is 10 and --depth is 50.
 
+--threads=<n>::
+	This option is passed through to `git pack-objects`.
+
 --window-memory=<n>::
 	This option provides an additional limit on top of `--window`;
 	the window size will dynamically scale down so as to not take
@@ -129,6 +132,19 @@ other objects in that pack they already have locally.
 	This option is generally only useful if you are writing bitmaps
 	with `-b` or `repack.writeBitmaps`, as it ensures that the
 	bitmapped packfile has the necessary objects.
+
+--unpack-unreachable=<when>::
+	When loosening unreachable objects, do not bother loosening any
+	objects older than `<when>`. This can be used to optimize out
+	the write of any objects that would be immediately pruned by
+	a follow-up `git prune`.
+
+-k::
+--keep-unreachable::
+	When used with `-ad`, any unreachable objects from existing
+	packs will be appended to the end of the packfile instead of
+	being removed. In addition, any unreachable loose objects will
+	be packed (and their loose counterparts removed).
 
 Configuration
 -------------

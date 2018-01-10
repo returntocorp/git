@@ -154,6 +154,10 @@ test_expect_success 'test option parsing' '
 	test_must_fail git merge -s foobar c1 &&
 	test_must_fail git merge -s=foobar c1 &&
 	test_must_fail git merge -m &&
+	test_must_fail git merge --abort foobar &&
+	test_must_fail git merge --abort --quiet &&
+	test_must_fail git merge --continue foobar &&
+	test_must_fail git merge --continue --quiet &&
 	test_must_fail git merge
 '
 
@@ -693,7 +697,7 @@ test_expect_success 'merge --no-ff --edit' '
 	git cat-file commit HEAD >raw &&
 	grep "work done on the side branch" raw &&
 	sed "1,/^$/d" >actual raw &&
-	test_cmp actual expected
+	test_cmp expected actual
 '
 
 test_expect_success GPG 'merge --ff-only tag' '
@@ -705,7 +709,7 @@ test_expect_success GPG 'merge --ff-only tag' '
 	git merge --ff-only signed &&
 	git rev-parse signed^0 >expect &&
 	git rev-parse HEAD >actual &&
-	test_cmp actual expect
+	test_cmp expect actual
 '
 
 test_expect_success GPG 'merge --no-edit tag should skip editor' '
@@ -717,7 +721,7 @@ test_expect_success GPG 'merge --no-edit tag should skip editor' '
 	EDITOR=false git merge --no-edit signed &&
 	git rev-parse signed^0 >expect &&
 	git rev-parse HEAD^2 >actual &&
-	test_cmp actual expect
+	test_cmp expect actual
 '
 
 test_expect_success 'set up mod-256 conflict scenario' '
@@ -761,6 +765,28 @@ test_expect_success 'merge nothing into void' '
 		git fetch up &&
 		test_must_fail git merge FETCH_HEAD
 	)
+'
+
+test_expect_success 'merge can be completed with --continue' '
+	git reset --hard c0 &&
+	git merge --no-ff --no-commit c1 &&
+	git merge --continue &&
+	verify_parents $c0 $c1
+'
+
+write_script .git/FAKE_EDITOR <<EOF
+# kill -TERM command added below.
+EOF
+
+test_expect_success EXECKEEPSPID 'killed merge can be completed with --continue' '
+	git reset --hard c0 &&
+	! "$SHELL_PATH" -c '\''
+	  echo kill -TERM $$ >> .git/FAKE_EDITOR
+	  GIT_EDITOR=.git/FAKE_EDITOR
+	  export GIT_EDITOR
+	  exec git merge --no-ff --edit c1'\'' &&
+	git merge --continue &&
+	verify_parents $c0 $c1
 '
 
 test_done

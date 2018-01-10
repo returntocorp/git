@@ -5,21 +5,14 @@
 #define MAX_ARGS	32
 
 static const char *argv_exec_path;
+
+#ifdef RUNTIME_PREFIX
 static const char *argv0_path;
 
-char *system_path(const char *path)
+static const char *system_prefix(void)
 {
-#ifdef RUNTIME_PREFIX
 	static const char *prefix;
-#else
-	static const char *prefix = PREFIX;
-#endif
-	struct strbuf d = STRBUF_INIT;
 
-	if (is_absolute_path(path))
-		return xstrdup(path);
-
-#ifdef RUNTIME_PREFIX
 	assert(argv0_path);
 	assert(is_absolute_path(argv0_path));
 
@@ -32,27 +25,44 @@ char *system_path(const char *path)
 				"but prefix computation failed.  "
 				"Using static fallback '%s'.\n", prefix);
 	}
-#endif
-
-	strbuf_addf(&d, "%s/%s", prefix, path);
-	return strbuf_detach(&d, NULL);
+	return prefix;
 }
 
-const char *git_extract_argv0_path(const char *argv0)
+void git_extract_argv0_path(const char *argv0)
 {
 	const char *slash;
 
 	if (!argv0 || !*argv0)
-		return NULL;
+		return;
 
 	slash = find_last_dir_sep(argv0);
 
-	if (slash) {
+	if (slash)
 		argv0_path = xstrndup(argv0, slash - argv0);
-		return slash + 1;
-	}
+}
 
-	return argv0;
+#else
+
+static const char *system_prefix(void)
+{
+	return PREFIX;
+}
+
+void git_extract_argv0_path(const char *argv0)
+{
+}
+
+#endif /* RUNTIME_PREFIX */
+
+char *system_path(const char *path)
+{
+	struct strbuf d = STRBUF_INIT;
+
+	if (is_absolute_path(path))
+		return xstrdup(path);
+
+	strbuf_addf(&d, "%s/%s", system_prefix(), path);
+	return strbuf_detach(&d, NULL);
 }
 
 void git_set_argv_exec_path(const char *exec_path)
@@ -68,17 +78,19 @@ void git_set_argv_exec_path(const char *exec_path)
 /* Returns the highest-priority, location to look for git programs. */
 const char *git_exec_path(void)
 {
-	const char *env;
+	static char *cached_exec_path;
 
 	if (argv_exec_path)
 		return argv_exec_path;
 
-	env = getenv(EXEC_PATH_ENVIRONMENT);
-	if (env && *env) {
-		return env;
+	if (!cached_exec_path) {
+		const char *env = getenv(EXEC_PATH_ENVIRONMENT);
+		if (env && *env)
+			cached_exec_path = xstrdup(env);
+		else
+			cached_exec_path = system_path(GIT_EXEC_PATH);
 	}
-
-	return system_path(GIT_EXEC_PATH);
+	return cached_exec_path;
 }
 
 static void add_path(struct strbuf *out, const char *path)

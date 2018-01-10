@@ -9,6 +9,7 @@
 #include "pack-bitmap.h"
 #include "pack-revindex.h"
 #include "pack-objects.h"
+#include "packfile.h"
 
 /*
  * An entry on the bitmap index, representing the bitmap for a given
@@ -266,7 +267,7 @@ static int open_pack_bitmap_1(struct packed_git *packfile)
 		return -1;
 
 	idx_name = pack_bitmap_filename(packfile);
-	fd = git_open_noatime(idx_name);
+	fd = git_open(idx_name);
 	free(idx_name);
 
 	if (fd < 0)
@@ -586,7 +587,7 @@ static void show_extended_objects(struct bitmap *objects,
 			continue;
 
 		obj = eindex->objects[i];
-		show_reach(obj->oid.hash, obj->type, 0, eindex->hashes[i], NULL, 0);
+		show_reach(&obj->oid, obj->type, 0, eindex->hashes[i], NULL, 0);
 	}
 }
 
@@ -611,7 +612,7 @@ static void show_objects_for_type(
 		eword_t word = objects->words[i] & filter;
 
 		for (offset = 0; offset < BITS_IN_EWORD; ++offset) {
-			const unsigned char *sha1;
+			struct object_id oid;
 			struct revindex_entry *entry;
 			uint32_t hash = 0;
 
@@ -624,12 +625,12 @@ static void show_objects_for_type(
 				continue;
 
 			entry = &bitmap_git.pack->revindex[pos + offset];
-			sha1 = nth_packed_object_sha1(bitmap_git.pack, entry->nr);
+			nth_packed_object_oid(&oid, bitmap_git.pack, entry->nr);
 
 			if (bitmap_git.hashes)
-				hash = ntohl(bitmap_git.hashes[entry->nr]);
+				hash = get_be32(bitmap_git.hashes + entry->nr);
 
-			show_reach(sha1, object_type, 0, hash, bitmap_git.pack, entry->offset);
+			show_reach(&oid, object_type, 0, hash, bitmap_git.pack, entry->offset);
 		}
 
 		pos += BITS_IN_EWORD;
@@ -653,8 +654,6 @@ static int in_bitmapped_pack(struct object_list *roots)
 int prepare_bitmap_walk(struct rev_info *revs)
 {
 	unsigned int i;
-	unsigned int pending_nr = revs->pending.nr;
-	struct object_array_entry *pending_e = revs->pending.objects;
 
 	struct object_list *wants = NULL;
 	struct object_list *haves = NULL;
@@ -669,11 +668,11 @@ int prepare_bitmap_walk(struct rev_info *revs)
 			return -1;
 	}
 
-	for (i = 0; i < pending_nr; ++i) {
-		struct object *object = pending_e[i].item;
+	for (i = 0; i < revs->pending.nr; ++i) {
+		struct object *object = revs->pending.objects[i].item;
 
 		if (object->type == OBJ_NONE)
-			parse_object_or_die(object->oid.hash, NULL);
+			parse_object_or_die(&object->oid, NULL);
 
 		while (object->type == OBJ_TAG) {
 			struct tag *tag = (struct tag *) object;
@@ -685,7 +684,7 @@ int prepare_bitmap_walk(struct rev_info *revs)
 
 			if (!tag->tagged)
 				die("bad tag");
-			object = parse_object_or_die(tag->tagged->oid.hash, NULL);
+			object = parse_object_or_die(&tag->tagged->oid, NULL);
 		}
 
 		if (object->flags & UNINTERESTING)
@@ -714,9 +713,7 @@ int prepare_bitmap_walk(struct rev_info *revs)
 	if (!bitmap_git.loaded && load_pack_bitmap() < 0)
 		return -1;
 
-	revs->pending.nr = 0;
-	revs->pending.alloc = 0;
-	revs->pending.objects = NULL;
+	object_array_clear(&revs->pending);
 
 	if (haves) {
 		revs->ignore_missing_links = 1;

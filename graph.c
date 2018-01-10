@@ -1,9 +1,10 @@
 #include "cache.h"
+#include "config.h"
 #include "commit.h"
 #include "color.h"
 #include "graph.h"
-#include "diff.h"
 #include "revision.h"
+#include "argv-array.h"
 
 /* Internal API */
 
@@ -17,8 +18,8 @@
 static void graph_padding_line(struct git_graph *graph, struct strbuf *sb);
 
 /*
- * Print a strbuf to stdout.  If the graph is non-NULL, all lines but the
- * first will be prefixed with the graph output.
+ * Print a strbuf.  If the graph is non-NULL, all lines but the first will be
+ * prefixed with the graph output.
  *
  * If the strbuf ends with a newline, the output will end after this
  * newline.  A new graph line will not be printed after the final newline.
@@ -28,8 +29,15 @@ static void graph_padding_line(struct git_graph *graph, struct strbuf *sb);
  * responsible for printing this line's graph (perhaps via
  * graph_show_commit() or graph_show_oneline()) before calling
  * graph_show_strbuf().
+ *
+ * Note that unlike some other graph display functions, you must pass the file
+ * handle directly. It is assumed that this is the same file handle as the
+ * file specified by the graph diff options. This is necessary so that
+ * graph_show_strbuf can be called even with a NULL graph.
  */
-static void graph_show_strbuf(struct git_graph *graph, struct strbuf const *sb);
+static void graph_show_strbuf(struct git_graph *graph,
+			      FILE *file,
+			      struct strbuf const *sb);
 
 /*
  * TODO:
@@ -59,8 +67,39 @@ enum graph_state {
 	GRAPH_COLLAPSING
 };
 
+static void graph_show_line_prefix(const struct diff_options *diffopt)
+{
+	if (!diffopt || !diffopt->line_prefix)
+		return;
+
+	fwrite(diffopt->line_prefix,
+	       sizeof(char),
+	       diffopt->line_prefix_length,
+	       diffopt->file);
+}
+
 static const char **column_colors;
 static unsigned short column_colors_max;
+
+static void parse_graph_colors_config(struct argv_array *colors, const char *string)
+{
+	const char *end, *start;
+
+	start = string;
+	end = string + strlen(string);
+	while (start < end) {
+		const char *comma = strchrnul(start, ',');
+		char color[COLOR_MAXLEN];
+
+		if (!color_parse_mem(start, comma - start, color))
+			argv_array_push(colors, color);
+		else
+			warning(_("ignore invalid color '%.*s' in log.graphColors"),
+				(int)(comma - start), start);
+		start = comma + 1;
+	}
+	argv_array_push(colors, GIT_COLOR_RESET);
+}
 
 void graph_set_column_colors(const char **colors, unsigned short colors_max)
 {
@@ -195,21 +234,48 @@ static struct strbuf *diff_output_prefix_callback(struct diff_options *opt, void
 	static struct strbuf msgbuf = STRBUF_INIT;
 
 	assert(opt);
-	assert(graph);
 
-	opt->output_prefix_length = graph->width;
 	strbuf_reset(&msgbuf);
-	graph_padding_line(graph, &msgbuf);
+	if (opt->line_prefix)
+		strbuf_add(&msgbuf, opt->line_prefix,
+			   opt->line_prefix_length);
+	if (graph)
+		graph_padding_line(graph, &msgbuf);
 	return &msgbuf;
 }
+
+static const struct diff_options *default_diffopt;
+
+void graph_setup_line_prefix(struct diff_options *diffopt)
+{
+	default_diffopt = diffopt;
+
+	/* setup an output prefix callback if necessary */
+	if (diffopt && !diffopt->output_prefix)
+		diffopt->output_prefix = diff_output_prefix_callback;
+}
+
 
 struct git_graph *graph_init(struct rev_info *opt)
 {
 	struct git_graph *graph = xmalloc(sizeof(struct git_graph));
 
-	if (!column_colors)
-		graph_set_column_colors(column_colors_ansi,
-					column_colors_ansi_max);
+	if (!column_colors) {
+		char *string;
+		if (git_config_get_string("log.graphcolors", &string)) {
+			/* not configured -- use default */
+			graph_set_column_colors(column_colors_ansi,
+						column_colors_ansi_max);
+		} else {
+			static struct argv_array custom_colors = ARGV_ARRAY_INIT;
+			argv_array_clear(&custom_colors);
+			parse_graph_colors_config(&custom_colors, string);
+			free(string);
+			/* graph_set_column_colors takes a max-index, not a count */
+			graph_set_column_colors(custom_colors.argv,
+						custom_colors.argc - 1);
+		}
+	}
 
 	graph->commit = NULL;
 	graph->revs = opt;
@@ -245,7 +311,6 @@ struct git_graph *graph_init(struct rev_info *opt)
 	 */
 	opt->diffopt.output_prefix = diff_output_prefix_callback;
 	opt->diffopt.output_prefix_data = graph;
-	opt->diffopt.output_prefix_length = 0;
 
 	return graph;
 }
@@ -433,7 +498,6 @@ static void graph_update_width(struct git_graph *graph,
 static void graph_update_columns(struct git_graph *graph)
 {
 	struct commit_list *parent;
-	struct column *tmp_columns;
 	int max_new_columns;
 	int mapping_idx;
 	int i, seen_this, is_commit_in_columns;
@@ -446,11 +510,8 @@ static void graph_update_columns(struct git_graph *graph)
 	 * We'll re-use the old columns array as storage to compute the new
 	 * columns list for the commit after this one.
 	 */
-	tmp_columns = graph->columns;
-	graph->columns = graph->new_columns;
+	SWAP(graph->columns, graph->new_columns);
 	graph->num_columns = graph->num_new_columns;
-
-	graph->new_columns = tmp_columns;
 	graph->num_new_columns = 0;
 
 	/*
@@ -635,12 +696,8 @@ static void graph_pad_horizontally(struct git_graph *graph, struct strbuf *sb,
 	 * This way, fields printed to the right of the graph will remain
 	 * aligned for the entire commit.
 	 */
-	int extra;
-	if (chars_written >= graph->width)
-		return;
-
-	extra = graph->width - chars_written;
-	strbuf_addf(sb, "%*s", (int) extra, "");
+	if (chars_written < graph->width)
+		strbuf_addchars(sb, ' ', graph->width - chars_written);
 }
 
 static void graph_output_padding_line(struct git_graph *graph,
@@ -726,7 +783,7 @@ static void graph_output_pre_commit_line(struct git_graph *graph,
 		if (col->commit == graph->commit) {
 			seen_this = 1;
 			strbuf_write_column(sb, col, '|');
-			strbuf_addf(sb, "%*s", graph->expansion_row, "");
+			strbuf_addchars(sb, ' ', graph->expansion_row);
 			chars_written += 1 + graph->expansion_row;
 		} else if (seen_this && (graph->expansion_row == 0)) {
 			/*
@@ -967,7 +1024,6 @@ static void graph_output_post_merge_line(struct git_graph *graph, struct strbuf 
 static void graph_output_collapsing_line(struct git_graph *graph, struct strbuf *sb)
 {
 	int i;
-	int *tmp_mapping;
 	short used_horizontal = 0;
 	int horizontal_edge = -1;
 	int horizontal_edge_target = -1;
@@ -1102,9 +1158,7 @@ static void graph_output_collapsing_line(struct git_graph *graph, struct strbuf 
 	/*
 	 * Swap mapping and new_mapping
 	 */
-	tmp_mapping = graph->mapping;
-	graph->mapping = graph->new_mapping;
-	graph->new_mapping = tmp_mapping;
+	SWAP(graph->mapping, graph->new_mapping);
 
 	/*
 	 * If graph->mapping indicates that all of the branch lines
@@ -1145,6 +1199,7 @@ int graph_next_line(struct git_graph *graph, struct strbuf *sb)
 static void graph_padding_line(struct git_graph *graph, struct strbuf *sb)
 {
 	int i;
+	int chars_written = 0;
 
 	if (graph->state != GRAPH_COMMIT) {
 		graph_next_line(graph, sb);
@@ -1160,14 +1215,21 @@ static void graph_padding_line(struct git_graph *graph, struct strbuf *sb)
 	 */
 	for (i = 0; i < graph->num_columns; i++) {
 		struct column *col = &graph->columns[i];
+
 		strbuf_write_column(sb, col, '|');
-		if (col->commit == graph->commit && graph->num_parents > 2)
-			strbuf_addchars(sb, ' ', (graph->num_parents - 2) * 2);
-		else
+		chars_written++;
+
+		if (col->commit == graph->commit && graph->num_parents > 2) {
+			int len = (graph->num_parents - 2) * 2;
+			strbuf_addchars(sb, ' ', len);
+			chars_written += len;
+		} else {
 			strbuf_addch(sb, ' ');
+			chars_written++;
+		}
 	}
 
-	graph_pad_horizontally(graph, sb, graph->num_columns);
+	graph_pad_horizontally(graph, sb, chars_written);
 
 	/*
 	 * Update graph->prev_state since we have output a padding line
@@ -1185,6 +1247,8 @@ void graph_show_commit(struct git_graph *graph)
 	struct strbuf msgbuf = STRBUF_INIT;
 	int shown_commit_line = 0;
 
+	graph_show_line_prefix(default_diffopt);
+
 	if (!graph)
 		return;
 
@@ -1200,9 +1264,12 @@ void graph_show_commit(struct git_graph *graph)
 
 	while (!shown_commit_line && !graph_is_commit_finished(graph)) {
 		shown_commit_line = graph_next_line(graph, &msgbuf);
-		fwrite(msgbuf.buf, sizeof(char), msgbuf.len, stdout);
-		if (!shown_commit_line)
-			putchar('\n');
+		fwrite(msgbuf.buf, sizeof(char), msgbuf.len,
+			graph->revs->diffopt.file);
+		if (!shown_commit_line) {
+			putc('\n', graph->revs->diffopt.file);
+			graph_show_line_prefix(&graph->revs->diffopt);
+		}
 		strbuf_setlen(&msgbuf, 0);
 	}
 
@@ -1213,11 +1280,13 @@ void graph_show_oneline(struct git_graph *graph)
 {
 	struct strbuf msgbuf = STRBUF_INIT;
 
+	graph_show_line_prefix(default_diffopt);
+
 	if (!graph)
 		return;
 
 	graph_next_line(graph, &msgbuf);
-	fwrite(msgbuf.buf, sizeof(char), msgbuf.len, stdout);
+	fwrite(msgbuf.buf, sizeof(char), msgbuf.len, graph->revs->diffopt.file);
 	strbuf_release(&msgbuf);
 }
 
@@ -1225,11 +1294,13 @@ void graph_show_padding(struct git_graph *graph)
 {
 	struct strbuf msgbuf = STRBUF_INIT;
 
+	graph_show_line_prefix(default_diffopt);
+
 	if (!graph)
 		return;
 
 	graph_padding_line(graph, &msgbuf);
-	fwrite(msgbuf.buf, sizeof(char), msgbuf.len, stdout);
+	fwrite(msgbuf.buf, sizeof(char), msgbuf.len, graph->revs->diffopt.file);
 	strbuf_release(&msgbuf);
 }
 
@@ -1237,6 +1308,8 @@ int graph_show_remainder(struct git_graph *graph)
 {
 	struct strbuf msgbuf = STRBUF_INIT;
 	int shown = 0;
+
+	graph_show_line_prefix(default_diffopt);
 
 	if (!graph)
 		return 0;
@@ -1246,29 +1319,28 @@ int graph_show_remainder(struct git_graph *graph)
 
 	for (;;) {
 		graph_next_line(graph, &msgbuf);
-		fwrite(msgbuf.buf, sizeof(char), msgbuf.len, stdout);
+		fwrite(msgbuf.buf, sizeof(char), msgbuf.len,
+			graph->revs->diffopt.file);
 		strbuf_setlen(&msgbuf, 0);
 		shown = 1;
 
-		if (!graph_is_commit_finished(graph))
-			putchar('\n');
-		else
+		if (!graph_is_commit_finished(graph)) {
+			putc('\n', graph->revs->diffopt.file);
+			graph_show_line_prefix(&graph->revs->diffopt);
+		} else {
 			break;
+		}
 	}
 	strbuf_release(&msgbuf);
 
 	return shown;
 }
 
-
-static void graph_show_strbuf(struct git_graph *graph, struct strbuf const *sb)
+static void graph_show_strbuf(struct git_graph *graph,
+			      FILE *file,
+			      struct strbuf const *sb)
 {
 	char *p;
-
-	if (!graph) {
-		fwrite(sb->buf, sizeof(char), sb->len, stdout);
-		return;
-	}
 
 	/*
 	 * Print the strbuf line by line,
@@ -1284,7 +1356,7 @@ static void graph_show_strbuf(struct git_graph *graph, struct strbuf const *sb)
 		} else {
 			len = (sb->buf + sb->len) - p;
 		}
-		fwrite(p, sizeof(char), len, stdout);
+		fwrite(p, sizeof(char), len, file);
 		if (next_p && *next_p != '\0')
 			graph_show_oneline(graph);
 		p = next_p;
@@ -1292,28 +1364,20 @@ static void graph_show_strbuf(struct git_graph *graph, struct strbuf const *sb)
 }
 
 void graph_show_commit_msg(struct git_graph *graph,
+			   FILE *file,
 			   struct strbuf const *sb)
 {
 	int newline_terminated;
 
-	if (!graph) {
-		/*
-		 * If there's no graph, just print the message buffer.
-		 *
-		 * The message buffer for CMIT_FMT_ONELINE and
-		 * CMIT_FMT_USERFORMAT are already missing a terminating
-		 * newline.  All of the other formats should have it.
-		 */
-		fwrite(sb->buf, sizeof(char), sb->len, stdout);
-		return;
-	}
-
-	newline_terminated = (sb->len && sb->buf[sb->len - 1] == '\n');
-
 	/*
 	 * Show the commit message
 	 */
-	graph_show_strbuf(graph, sb);
+	graph_show_strbuf(graph, file, sb);
+
+	if (!graph)
+		return;
+
+	newline_terminated = (sb->len && sb->buf[sb->len - 1] == '\n');
 
 	/*
 	 * If there is more output needed for this commit, show it now
@@ -1325,7 +1389,7 @@ void graph_show_commit_msg(struct git_graph *graph,
 		 * new line.
 		 */
 		if (!newline_terminated)
-			putchar('\n');
+			putc('\n', file);
 
 		graph_show_remainder(graph);
 
@@ -1333,6 +1397,6 @@ void graph_show_commit_msg(struct git_graph *graph,
 		 * If sb ends with a newline, our output should too.
 		 */
 		if (newline_terminated)
-			putchar('\n');
+			putc('\n', file);
 	}
 }

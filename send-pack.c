@@ -1,4 +1,5 @@
 #include "builtin.h"
+#include "config.h"
 #include "commit.h"
 #include "refs.h"
 #include "pkt-line.h"
@@ -50,7 +51,7 @@ static void feed_object(const unsigned char *sha1, FILE *fh, int negative)
 /*
  * Make a pack stream and spit it out into file descriptor fd
  */
-static int pack_objects(int fd, struct ref *refs, struct sha1_array *extra, struct send_pack_args *args)
+static int pack_objects(int fd, struct ref *refs, struct oid_array *extra, struct send_pack_args *args)
 {
 	/*
 	 * The child becomes pack-objects --revs; we feed
@@ -72,6 +73,7 @@ static int pack_objects(int fd, struct ref *refs, struct sha1_array *extra, stru
 	struct child_process po = CHILD_PROCESS_INIT;
 	FILE *po_in;
 	int i;
+	int rc;
 
 	i = 4;
 	if (args->use_thin_pack)
@@ -97,7 +99,7 @@ static int pack_objects(int fd, struct ref *refs, struct sha1_array *extra, stru
 	 */
 	po_in = xfdopen(po.in, "w");
 	for (i = 0; i < extra->nr; i++)
-		feed_object(extra->sha1[i], po_in, 1);
+		feed_object(extra->oid[i].hash, po_in, 1);
 
 	while (refs) {
 		if (!is_null_oid(&refs->old_oid))
@@ -125,27 +127,44 @@ static int pack_objects(int fd, struct ref *refs, struct sha1_array *extra, stru
 		po.out = -1;
 	}
 
-	if (finish_command(&po))
+	rc = finish_command(&po);
+	if (rc) {
+		/*
+		 * For a normal non-zero exit, we assume pack-objects wrote
+		 * something useful to stderr. For death by signal, though,
+		 * we should mention it to the user. The exception is SIGPIPE
+		 * (141), because that's a normal occurrence if the remote end
+		 * hangs up (and we'll report that by trying to read the unpack
+		 * status).
+		 */
+		if (rc > 128 && rc != 141)
+			error("pack-objects died of signal %d", rc - 128);
 		return -1;
+	}
+	return 0;
+}
+
+static int receive_unpack_status(int in)
+{
+	const char *line = packet_read_line(in, NULL);
+	if (!skip_prefix(line, "unpack ", &line))
+		return error(_("unable to parse remote unpack status: %s"), line);
+	if (strcmp(line, "ok"))
+		return error(_("remote unpack failed: %s"), line);
 	return 0;
 }
 
 static int receive_status(int in, struct ref *refs)
 {
 	struct ref *hint;
-	int ret = 0;
-	char *line = packet_read_line(in, NULL);
-	if (!starts_with(line, "unpack "))
-		return error("did not receive remote status");
-	if (strcmp(line, "unpack ok")) {
-		error("unpack failed: %s", line + 7);
-		ret = -1;
-	}
+	int ret;
+
 	hint = NULL;
+	ret = receive_unpack_status(in);
 	while (1) {
 		char *refname;
 		char *msg;
-		line = packet_read_line(in, NULL);
+		char *line = packet_read_line(in, NULL);
 		if (!line)
 			break;
 		if (!starts_with(line, "ok ") && !starts_with(line, "ng ")) {
@@ -181,8 +200,7 @@ static int receive_status(int in, struct ref *refs)
 			hint->status = REF_STATUS_REMOTE_REJECT;
 			ret = -1;
 		}
-		if (msg)
-			hint->remote_status = xstrdup(msg);
+		hint->remote_status = xstrdup_or_null(msg);
 		/* start our next search from the next ref */
 		hint = hint->next;
 	}
@@ -260,6 +278,7 @@ static int generate_push_cert(struct strbuf *req_buf,
 			      const char *push_cert_nonce)
 {
 	const struct ref *ref;
+	struct string_list_item *item;
 	char *signing_key = xstrdup(get_signing_key());
 	const char *cp, *np;
 	struct strbuf cert = STRBUF_INIT;
@@ -276,6 +295,9 @@ static int generate_push_cert(struct strbuf *req_buf,
 	}
 	if (push_cert_nonce[0])
 		strbuf_addf(&cert, "nonce %s\n", push_cert_nonce);
+	if (args->push_options)
+		for_each_string_list_item(item, args->push_options)
+			strbuf_addf(&cert, "push-option %s\n", item->string);
 	strbuf_addstr(&cert, "\n");
 
 	for (ref = remote_refs; ref; ref = ref->next) {
@@ -355,7 +377,7 @@ static void reject_invalid_nonce(const char *nonce, int len)
 int send_pack(struct send_pack_args *args,
 	      int fd[], struct child_process *conn,
 	      struct ref *remote_refs,
-	      struct sha1_array *extra_have)
+	      struct oid_array *extra_have)
 {
 	int in = fd[0];
 	int out = fd[1];
@@ -370,6 +392,8 @@ int send_pack(struct send_pack_args *args,
 	int agent_supported = 0;
 	int use_atomic = 0;
 	int atomic_supported = 0;
+	int use_push_options = 0;
+	int push_options_supported = 0;
 	unsigned cmds_sent = 0;
 	int ret;
 	struct async demux;
@@ -392,6 +416,8 @@ int send_pack(struct send_pack_args *args,
 		args->use_thin_pack = 0;
 	if (server_supports("atomic"))
 		atomic_supported = 1;
+	if (server_supports("push-options"))
+		push_options_supported = 1;
 
 	if (args->push_cert != SEND_PACK_PUSH_CERT_NEVER) {
 		int len;
@@ -418,6 +444,11 @@ int send_pack(struct send_pack_args *args,
 
 	use_atomic = atomic_supported && args->atomic;
 
+	if (args->push_options && !push_options_supported)
+		die(_("the receiving end does not support push options"));
+
+	use_push_options = push_options_supported && args->push_options;
+
 	if (status_report)
 		strbuf_addstr(&cap_buf, " report-status");
 	if (use_sideband)
@@ -426,6 +457,8 @@ int send_pack(struct send_pack_args *args,
 		strbuf_addstr(&cap_buf, " quiet");
 	if (use_atomic)
 		strbuf_addstr(&cap_buf, " atomic");
+	if (use_push_options)
+		strbuf_addstr(&cap_buf, " push-options");
 	if (agent_supported)
 		strbuf_addf(&cap_buf, " agent=%s", git_user_agent_sanitized());
 
@@ -459,9 +492,12 @@ int send_pack(struct send_pack_args *args,
 			 * we were to send it and we're trying to send the refs
 			 * atomically, abort the whole operation.
 			 */
-			if (use_atomic)
+			if (use_atomic) {
+				strbuf_release(&req_buf);
+				strbuf_release(&cap_buf);
 				return atomic_push_failure(args, remote_refs, ref);
-			/* Fallthrough for non atomic case. */
+			}
+			/* else fallthrough */
 		default:
 			continue;
 		}
@@ -500,6 +536,14 @@ int send_pack(struct send_pack_args *args,
 		}
 	}
 
+	if (use_push_options) {
+		struct string_list_item *item;
+
+		packet_buf_flush(&req_buf);
+		for_each_string_list_item(item, args->push_options)
+			packet_buf_write(&req_buf, "%s", item->string);
+	}
+
 	if (args->stateless_rpc) {
 		if (!args->dry_run && (cmds_sent || is_repository_shallow())) {
 			packet_buf_flush(&req_buf);
@@ -531,6 +575,14 @@ int send_pack(struct send_pack_args *args,
 				close(out);
 			if (git_connection_is_socket(conn))
 				shutdown(fd[0], SHUT_WR);
+
+			/*
+			 * Do not even bother with the return value; we know we
+			 * are failing, and just want the error() side effects.
+			 */
+			if (status_report)
+				receive_unpack_status(in);
+
 			if (use_sideband) {
 				close(demux.out);
 				finish_async(&demux);

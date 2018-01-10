@@ -2,6 +2,7 @@
  * "git push"
  */
 #include "cache.h"
+#include "config.h"
 #include "refs.h"
 #include "run-command.h"
 #include "builtin.h"
@@ -30,6 +31,8 @@ static struct push_cas_option cas;
 static const char **refspec;
 static int refspec_nr;
 static int refspec_alloc;
+
+static struct string_list push_options_config = STRING_LIST_INIT_DUP;
 
 static void add_refspec(const char *ref)
 {
@@ -194,15 +197,18 @@ static void setup_push_upstream(struct remote *remote, struct branch *branch,
 			die_push_simple(branch, remote);
 	}
 
-	strbuf_addf(&refspec, "%s:%s", branch->name, branch->merge[0]->src);
+	strbuf_addf(&refspec, "%s:%s", branch->refname, branch->merge[0]->src);
 	add_refspec(refspec.buf);
 }
 
 static void setup_push_current(struct remote *remote, struct branch *branch)
 {
+	struct strbuf refspec = STRBUF_INIT;
+
 	if (!branch)
 		die(_(message_detached_head_die), remote->name);
-	add_refspec(branch->name);
+	strbuf_addf(&refspec, "%s:%s", branch->refname, branch->refname);
+	add_refspec(refspec.buf);
 }
 
 static int is_workflow_triangular(struct remote *remote)
@@ -353,7 +359,8 @@ static int push_with_options(struct transport *transport, int flags)
 	return 1;
 }
 
-static int do_push(const char *repo, int flags)
+static int do_push(const char *repo, int flags,
+		   const struct string_list *push_options)
 {
 	int i, errs;
 	struct remote *remote = pushremote_get(repo);
@@ -375,6 +382,9 @@ static int do_push(const char *repo, int flags)
 
 	if (remote->mirror)
 		flags |= (TRANSPORT_PUSH_MIRROR|TRANSPORT_PUSH_FORCE);
+
+	if (push_options->nr)
+		flags |= TRANSPORT_PUSH_OPTIONS;
 
 	if ((flags & TRANSPORT_PUSH_ALL) && refspec) {
 		if (!strcmp(*refspec, "refs/tags/*"))
@@ -406,13 +416,16 @@ static int do_push(const char *repo, int flags)
 		for (i = 0; i < url_nr; i++) {
 			struct transport *transport =
 				transport_get(remote, url[i]);
+			if (flags & TRANSPORT_PUSH_OPTIONS)
+				transport->push_options = push_options;
 			if (push_with_options(transport, flags))
 				errs++;
 		}
 	} else {
 		struct transport *transport =
 			transport_get(remote, NULL);
-
+		if (flags & TRANSPORT_PUSH_OPTIONS)
+			transport->push_options = push_options;
 		if (push_with_options(transport, flags))
 			errs++;
 	}
@@ -470,7 +483,7 @@ static int git_push_config(const char *k, const char *v, void *cb)
 	} else if (!strcmp(k, "push.gpgsign")) {
 		const char *value;
 		if (!git_config_get_value("push.gpgsign", &value)) {
-			switch (git_config_maybe_bool("push.gpgsign", value)) {
+			switch (git_parse_maybe_bool(value)) {
 			case 0:
 				set_push_cert_flags(flags, SEND_PACK_PUSH_CERT_NEVER);
 				break;
@@ -488,6 +501,19 @@ static int git_push_config(const char *k, const char *v, void *cb)
 		const char *value;
 		if (!git_config_get_value("push.recursesubmodules", &value))
 			recurse_submodules = parse_push_recurse_submodules_arg(k, value);
+	} else if (!strcmp(k, "submodule.recurse")) {
+		int val = git_config_bool(k, v) ?
+			RECURSE_SUBMODULES_ON_DEMAND : RECURSE_SUBMODULES_OFF;
+		recurse_submodules = val;
+	} else if (!strcmp(k, "push.pushoption")) {
+		if (!v)
+			return config_error_nonbool(k);
+		else
+			if (!*v)
+				string_list_clear(&push_options_config, 0);
+			else
+				string_list_append(&push_options_config, v);
+		return 0;
 	}
 
 	return git_default_config(k, v, NULL);
@@ -500,6 +526,10 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 	int push_cert = -1;
 	int rc;
 	const char *repo = NULL;	/* default repository */
+	struct string_list push_options_cmdline = STRING_LIST_INIT_DUP;
+	struct string_list *push_options;
+	const struct string_list_item *item;
+
 	struct option options[] = {
 		OPT__VERBOSITY(&verbosity),
 		OPT_STRING( 0 , "repo", &repo, N_("repository"), N_("repository")),
@@ -533,6 +563,7 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 		  0, "signed", &push_cert, "yes|no|if-asked", N_("GPG sign the push"),
 		  PARSE_OPT_OPTARG, option_parse_push_signed },
 		OPT_BIT(0, "atomic", &flags, N_("request atomic transaction on remote side"), TRANSPORT_PUSH_ATOMIC),
+		OPT_STRING_LIST('o', "push-option", &push_options_cmdline, N_("server-specific"), N_("option to transmit")),
 		OPT_SET_INT('4', "ipv4", &family, N_("use IPv4 addresses only"),
 				TRANSPORT_FAMILY_IPV4),
 		OPT_SET_INT('6', "ipv6", &family, N_("use IPv6 addresses only"),
@@ -543,6 +574,9 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 	packet_trace_identity("push");
 	git_config(git_push_config, &flags);
 	argc = parse_options(argc, argv, prefix, options, push_usage, 0);
+	push_options = (push_options_cmdline.nr
+		? &push_options_cmdline
+		: &push_options_config);
 	set_push_cert_flags(&flags, push_cert);
 
 	if (deleterefs && (tags || (flags & (TRANSPORT_PUSH_ALL | TRANSPORT_PUSH_MIRROR))))
@@ -554,6 +588,8 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 		flags |= TRANSPORT_RECURSE_SUBMODULES_CHECK;
 	else if (recurse_submodules == RECURSE_SUBMODULES_ON_DEMAND)
 		flags |= TRANSPORT_RECURSE_SUBMODULES_ON_DEMAND;
+	else if (recurse_submodules == RECURSE_SUBMODULES_ONLY)
+		flags |= TRANSPORT_RECURSE_SUBMODULES_ONLY;
 
 	if (tags)
 		add_refspec("refs/tags/*");
@@ -563,7 +599,13 @@ int cmd_push(int argc, const char **argv, const char *prefix)
 		set_refspecs(argv + 1, argc - 1, repo);
 	}
 
-	rc = do_push(repo, flags);
+	for_each_string_list_item(item, push_options)
+		if (strchr(item->string, '\n'))
+			die(_("push options must not have new line characters"));
+
+	rc = do_push(repo, flags, push_options);
+	string_list_clear(&push_options_cmdline, 0);
+	string_list_clear(&push_options_config, 0);
 	if (rc == -1)
 		usage_with_options(push_usage, options);
 	else

@@ -7,23 +7,6 @@ test_description='test git fast-import utility'
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/diff-lib.sh ;# test-lib chdir's into trash
 
-# Print $1 bytes from stdin to stdout.
-#
-# This could be written as "head -c $1", but IRIX "head" does not
-# support the -c option.
-head_c () {
-	perl -e '
-		my $len = $ARGV[1];
-		while ($len > 0) {
-			my $s;
-			my $nread = sysread(STDIN, $s, $len);
-			die "cannot read: $!" unless defined($nread);
-			print $s;
-			$len -= $nread;
-		}
-	' - "$1"
-}
-
 verify_packs () {
 	for p in .git/objects/pack/*.pack
 	do
@@ -52,6 +35,7 @@ echo "$@"'
 ###
 
 test_expect_success 'empty stream succeeds' '
+	git config fastimport.unpackLimit 0 &&
 	git fast-import </dev/null
 '
 
@@ -2480,7 +2464,7 @@ test_expect_success PIPE 'R: copy using cat-file' '
 
 		read blob_id type size <&3 &&
 		echo "$blob_id $type $size" >response &&
-		head_c $size >blob <&3 &&
+		test_copy_bytes $size >blob <&3 &&
 		read newline <&3 &&
 
 		cat <<-EOF &&
@@ -2523,7 +2507,7 @@ test_expect_success PIPE 'R: print blob mid-commit' '
 		EOF
 
 		read blob_id type size <&3 &&
-		head_c $size >actual <&3 &&
+		test_copy_bytes $size >actual <&3 &&
 		read newline <&3 &&
 
 		echo
@@ -2558,7 +2542,7 @@ test_expect_success PIPE 'R: print staged blob within commit' '
 		echo "cat-blob $to_get" &&
 
 		read blob_id type size <&3 &&
-		head_c $size >actual <&3 &&
+		test_copy_bytes $size >actual <&3 &&
 		read newline <&3 &&
 
 		echo deleteall
@@ -2690,6 +2674,7 @@ test_expect_success 'R: blob bigger than threshold' '
 	echo >>input &&
 
 	test_create_repo R &&
+	git --git-dir=R/.git config fastimport.unpackLimit 0 &&
 	git --git-dir=R/.git fast-import --big-file-threshold=1 <input
 '
 
@@ -2837,7 +2822,7 @@ test_expect_success 'S: filemodify with garbage after sha1 must fail' '
 #
 # notemodify, three ways to say dataref
 #
-test_expect_success 'S: notemodify with garabge after mark dataref must fail' '
+test_expect_success 'S: notemodify with garbage after mark dataref must fail' '
 	test_must_fail git fast-import --import-marks=marks <<-EOF 2>err &&
 	commit refs/heads/S
 	committer $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL> $GIT_COMMITTER_DATE
@@ -3133,6 +3118,148 @@ test_expect_success 'U: validate root delete result' '
 	git diff-tree -M -r U^1 U >actual &&
 
 	compare_diff_raw expect actual
+'
+
+###
+### series V (checkpoint)
+###
+
+# The commands in input_file should not produce any output on the file
+# descriptor set with --cat-blob-fd (or stdout if unspecified).
+#
+# To make sure you're observing the side effects of checkpoint *before*
+# fast-import terminates (and thus writes out its state), check that the
+# fast-import process is still running using background_import_still_running
+# *after* evaluating the test conditions.
+background_import_then_checkpoint () {
+	options=$1
+	input_file=$2
+
+	mkfifo V.input
+	exec 8<>V.input
+	rm V.input
+
+	mkfifo V.output
+	exec 9<>V.output
+	rm V.output
+
+	git fast-import $options <&8 >&9 &
+	echo $! >V.pid
+	# We don't mind if fast-import has already died by the time the test
+	# ends.
+	test_when_finished "exec 8>&-; exec 9>&-; kill $(cat V.pid) || true"
+
+	# Start in the background to ensure we adhere strictly to (blocking)
+	# pipes writing sequence. We want to assume that the write below could
+	# block, e.g. if fast-import blocks writing its own output to &9
+	# because there is no reader on &9 yet.
+	(
+		cat "$input_file"
+		echo "checkpoint"
+		echo "progress checkpoint"
+	) >&8 &
+
+	error=1 ;# assume the worst
+	while read output <&9
+	do
+		if test "$output" = "progress checkpoint"
+		then
+			error=0
+			break
+		fi
+		# otherwise ignore cruft
+		echo >&2 "cruft: $output"
+	done
+
+	if test $error -eq 1
+	then
+		false
+	fi
+}
+
+background_import_still_running () {
+	if ! kill -0 "$(cat V.pid)"
+	then
+		echo >&2 "background fast-import terminated too early"
+		false
+	fi
+}
+
+test_expect_success PIPE 'V: checkpoint helper does not get stuck with extra output' '
+	cat >input <<-INPUT_END &&
+	progress foo
+	progress bar
+
+	INPUT_END
+
+	background_import_then_checkpoint "" input &&
+	background_import_still_running
+'
+
+test_expect_success PIPE 'V: checkpoint updates refs after reset' '
+	cat >input <<-\INPUT_END &&
+	reset refs/heads/V
+	from refs/heads/U
+
+	INPUT_END
+
+	background_import_then_checkpoint "" input &&
+	test "$(git rev-parse --verify V)" = "$(git rev-parse --verify U)" &&
+	background_import_still_running
+'
+
+test_expect_success PIPE 'V: checkpoint updates refs and marks after commit' '
+	cat >input <<-INPUT_END &&
+	commit refs/heads/V
+	mark :1
+	committer $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL> $GIT_COMMITTER_DATE
+	data 0
+	from refs/heads/U
+
+	INPUT_END
+
+	background_import_then_checkpoint "--export-marks=marks.actual" input &&
+
+	echo ":1 $(git rev-parse --verify V)" >marks.expected &&
+
+	test "$(git rev-parse --verify V^)" = "$(git rev-parse --verify U)" &&
+	test_cmp marks.expected marks.actual &&
+	background_import_still_running
+'
+
+# Re-create the exact same commit, but on a different branch: no new object is
+# created in the database, but the refs and marks still need to be updated.
+test_expect_success PIPE 'V: checkpoint updates refs and marks after commit (no new objects)' '
+	cat >input <<-INPUT_END &&
+	commit refs/heads/V2
+	mark :2
+	committer $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL> $GIT_COMMITTER_DATE
+	data 0
+	from refs/heads/U
+
+	INPUT_END
+
+	background_import_then_checkpoint "--export-marks=marks.actual" input &&
+
+	echo ":2 $(git rev-parse --verify V2)" >marks.expected &&
+
+	test "$(git rev-parse --verify V2)" = "$(git rev-parse --verify V)" &&
+	test_cmp marks.expected marks.actual &&
+	background_import_still_running
+'
+
+test_expect_success PIPE 'V: checkpoint updates tags after tag' '
+	cat >input <<-INPUT_END &&
+	tag Vtag
+	from refs/heads/V
+	tagger $GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL> $GIT_COMMITTER_DATE
+	data 0
+
+	INPUT_END
+
+	background_import_then_checkpoint "" input &&
+	git show-ref -d Vtag &&
+	background_import_still_running
 '
 
 test_done

@@ -50,7 +50,7 @@ test_no_confirm () {
 		--smtp-server="$(pwd)/fake.sendmail" \
 		$@ \
 		$patches >stdout &&
-		test_must_fail grep "Send this email" stdout &&
+		! grep "Send this email" stdout &&
 		>no_confirm_okay
 }
 
@@ -138,6 +138,38 @@ test_expect_success $PREREQ 'setup expect' '
 
 test_expect_success $PREREQ 'Verify commandline' '
 	test_cmp expected commandline1
+'
+
+test_expect_success $PREREQ 'setup expect for cc trailer' "
+cat >expected-cc <<\EOF
+!recipient@example.com!
+!author@example.com!
+!one@example.com!
+!two@example.com!
+!three@example.com!
+!four@example.com!
+!five@example.com!
+!six@example.com!
+EOF
+"
+
+test_expect_success $PREREQ 'cc trailer with various syntax' '
+	test_commit cc-trailer &&
+	test_when_finished "git reset --hard HEAD^" &&
+	git commit --amend -F - <<-EOF &&
+	Test Cc: trailers.
+
+	Cc: one@example.com
+	Cc: <two@example.com> # trailing comments are ignored
+	Cc: <three@example.com>, <not.four@example.com> one address per line
+	Cc: "Some # Body" <four@example.com> [ <also.a.comment> ]
+	Cc: five@example.com # not.six@example.com
+	Cc: six@example.com, not.seven@example.com
+	EOF
+	clean_fake_sendmail &&
+	git send-email -1 --to=recipient@example.com \
+		--smtp-server="$(pwd)/fake.sendmail" &&
+	test_cmp expected-cc commandline1
 '
 
 test_expect_success $PREREQ 'setup expect' "
@@ -1234,7 +1266,7 @@ test_expect_success $PREREQ 'asks about and fixes 8bit encodings' '
 	grep email-using-8bit stdout &&
 	grep "Which 8bit encoding" stdout &&
 	egrep "Content|MIME" msgtxt1 >actual &&
-	test_cmp actual content-type-decl
+	test_cmp content-type-decl actual
 '
 
 test_expect_success $PREREQ 'sendemail.8bitEncoding works' '
@@ -1245,7 +1277,7 @@ test_expect_success $PREREQ 'sendemail.8bitEncoding works' '
 			--smtp-server="$(pwd)/fake.sendmail" \
 			email-using-8bit >stdout &&
 	egrep "Content|MIME" msgtxt1 >actual &&
-	test_cmp actual content-type-decl
+	test_cmp content-type-decl actual
 '
 
 test_expect_success $PREREQ '--8bit-encoding overrides sendemail.8bitEncoding' '
@@ -1257,7 +1289,7 @@ test_expect_success $PREREQ '--8bit-encoding overrides sendemail.8bitEncoding' '
 			--8bit-encoding=UTF-8 \
 			email-using-8bit >stdout &&
 	egrep "Content|MIME" msgtxt1 >actual &&
-	test_cmp actual content-type-decl
+	test_cmp content-type-decl actual
 '
 
 test_expect_success $PREREQ 'setup expect' '
@@ -1883,6 +1915,54 @@ test_expect_success $PREREQ 'leading and trailing whitespaces are removed' '
 	0001-add-master.patch | replace_variable_fields \
 	>actual-list &&
 	test_cmp expected-list actual-list
+'
+
+test_expect_success $PREREQ 'invoke hook' '
+	mkdir -p .git/hooks &&
+
+	write_script .git/hooks/sendemail-validate <<-\EOF &&
+	# test that we have the correct environment variable, pwd, and
+	# argument
+	case "$GIT_DIR" in
+	*.git)
+		true
+		;;
+	*)
+		false
+		;;
+	esac &&
+	test -f 0001-add-master.patch &&
+	grep "add master" "$1"
+	EOF
+
+	mkdir subdir &&
+	(
+		# Test that it works even if we are not at the root of the
+		# working tree
+		cd subdir &&
+		git send-email \
+			--from="Example <nobody@example.com>" \
+			--to=nobody@example.com \
+			--smtp-server="$(pwd)/../fake.sendmail" \
+			../0001-add-master.patch &&
+
+		# Verify error message when a patch is rejected by the hook
+		sed -e "s/add master/x/" ../0001-add-master.patch >../another.patch &&
+		git send-email \
+			--from="Example <nobody@example.com>" \
+			--to=nobody@example.com \
+			--smtp-server="$(pwd)/../fake.sendmail" \
+			../another.patch 2>err
+		test_i18ngrep "rejected by sendemail-validate hook" err
+	)
+'
+
+test_expect_success $PREREQ 'test that send-email works outside a repo' '
+	nongit git send-email \
+		--from="Example <nobody@example.com>" \
+		--to=nobody@example.com \
+		--smtp-server="$(pwd)/fake.sendmail" \
+		"$(pwd)/0001-add-master.patch"
 '
 
 test_done

@@ -3,6 +3,7 @@
 #include "commit.h"
 #include "tree.h"
 #include "blob.h"
+#include "gpg-interface.h"
 
 const char *tag_type = "tag";
 
@@ -24,13 +25,15 @@ static int run_gpg_verify(const char *buf, unsigned long size, unsigned flags)
 
 	ret = check_signature(buf, payload_size, buf + payload_size,
 				size - payload_size, &sigc);
-	print_signature_buffer(&sigc, flags);
+
+	if (!(flags & GPG_VERIFY_OMIT_STATUS))
+		print_signature_buffer(&sigc, flags);
 
 	signature_check_clear(&sigc);
 	return ret;
 }
 
-int gpg_verify_tag(const unsigned char *sha1, const char *name_to_report,
+int gpg_verify_tag(const struct object_id *oid, const char *name_to_report,
 		unsigned flags)
 {
 	enum object_type type;
@@ -38,20 +41,20 @@ int gpg_verify_tag(const unsigned char *sha1, const char *name_to_report,
 	unsigned long size;
 	int ret;
 
-	type = sha1_object_info(sha1, NULL);
+	type = sha1_object_info(oid->hash, NULL);
 	if (type != OBJ_TAG)
 		return error("%s: cannot verify a non-tag object of type %s.",
 				name_to_report ?
 				name_to_report :
-				find_unique_abbrev(sha1, DEFAULT_ABBREV),
+				find_unique_abbrev(oid->hash, DEFAULT_ABBREV),
 				typename(type));
 
-	buf = read_sha1_file(sha1, &type, &size);
+	buf = read_sha1_file(oid->hash, &type, &size);
 	if (!buf)
 		return error("%s: unable to read file.",
 				name_to_report ?
 				name_to_report :
-				find_unique_abbrev(sha1, DEFAULT_ABBREV));
+				find_unique_abbrev(oid->hash, DEFAULT_ABBREV));
 
 	ret = run_gpg_verify(buf, size, flags);
 
@@ -63,7 +66,7 @@ struct object *deref_tag(struct object *o, const char *warn, int warnlen)
 {
 	while (o && o->type == OBJ_TAG)
 		if (((struct tag *)o)->tagged)
-			o = parse_object(((struct tag *)o)->tagged->oid.hash);
+			o = parse_object(&((struct tag *)o)->tagged->oid);
 		else
 			o = NULL;
 	if (!o && warn) {
@@ -77,7 +80,7 @@ struct object *deref_tag(struct object *o, const char *warn, int warnlen)
 struct object *deref_tag_noverify(struct object *o)
 {
 	while (o && o->type == OBJ_TAG) {
-		o = parse_object(o->oid.hash);
+		o = parse_object(&o->oid);
 		if (o && o->type == OBJ_TAG && ((struct tag *)o)->tagged)
 			o = ((struct tag *)o)->tagged;
 		else
@@ -86,15 +89,15 @@ struct object *deref_tag_noverify(struct object *o)
 	return o;
 }
 
-struct tag *lookup_tag(const unsigned char *sha1)
+struct tag *lookup_tag(const struct object_id *oid)
 {
-	struct object *obj = lookup_object(sha1);
+	struct object *obj = lookup_object(oid->hash);
 	if (!obj)
-		return create_object(sha1, alloc_tag_node());
+		return create_object(oid->hash, alloc_tag_node());
 	return object_as_type(obj, OBJ_TAG, 0);
 }
 
-static unsigned long parse_tag_date(const char *buf, const char *tail)
+static timestamp_t parse_tag_date(const char *buf, const char *tail)
 {
 	const char *dateptr;
 
@@ -107,13 +110,13 @@ static unsigned long parse_tag_date(const char *buf, const char *tail)
 		/* nada */;
 	if (buf >= tail)
 		return 0;
-	/* dateptr < buf && buf[-1] == '\n', so strtoul will stop at buf-1 */
-	return strtoul(dateptr, NULL, 10);
+	/* dateptr < buf && buf[-1] == '\n', so parsing will stop at buf-1 */
+	return parse_timestamp(dateptr, NULL, 10);
 }
 
 int parse_tag_buffer(struct tag *item, const void *data, unsigned long size)
 {
-	unsigned char sha1[20];
+	struct object_id oid;
 	char type[20];
 	const char *bufptr = data;
 	const char *tail = bufptr + size;
@@ -123,11 +126,10 @@ int parse_tag_buffer(struct tag *item, const void *data, unsigned long size)
 		return 0;
 	item->object.parsed = 1;
 
-	if (size < 64)
+	if (size < GIT_SHA1_HEXSZ + 24)
 		return -1;
-	if (memcmp("object ", bufptr, 7) || get_sha1_hex(bufptr + 7, sha1) || bufptr[47] != '\n')
+	if (memcmp("object ", bufptr, 7) || parse_oid_hex(bufptr + 7, &oid, &bufptr) || *bufptr++ != '\n')
 		return -1;
-	bufptr += 48; /* "object " + sha1 + "\n" */
 
 	if (!starts_with(bufptr, "type "))
 		return -1;
@@ -140,13 +142,13 @@ int parse_tag_buffer(struct tag *item, const void *data, unsigned long size)
 	bufptr = nl + 1;
 
 	if (!strcmp(type, blob_type)) {
-		item->tagged = &lookup_blob(sha1)->object;
+		item->tagged = (struct object *)lookup_blob(&oid);
 	} else if (!strcmp(type, tree_type)) {
-		item->tagged = &lookup_tree(sha1)->object;
+		item->tagged = (struct object *)lookup_tree(&oid);
 	} else if (!strcmp(type, commit_type)) {
-		item->tagged = &lookup_commit(sha1)->object;
+		item->tagged = (struct object *)lookup_commit(&oid);
 	} else if (!strcmp(type, tag_type)) {
-		item->tagged = &lookup_tag(sha1)->object;
+		item->tagged = (struct object *)lookup_tag(&oid);
 	} else {
 		error("Unknown type %s", type);
 		item->tagged = NULL;

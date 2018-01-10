@@ -15,18 +15,37 @@ struct submodule {
 	const char *url;
 	int fetch_recurse;
 	const char *ignore;
+	const char *branch;
 	struct submodule_update_strategy update_strategy;
 	/* the sha1 blob id of the responsible .gitmodules file */
 	unsigned char gitmodules_sha1[20];
+	int recommend_shallow;
 };
 
-int parse_fetch_recurse_submodules_arg(const char *opt, const char *arg);
-int parse_push_recurse_submodules_arg(const char *opt, const char *arg);
-int parse_submodule_config_option(const char *var, const char *value);
-const struct submodule *submodule_from_name(const unsigned char *commit_sha1,
-		const char *name);
-const struct submodule *submodule_from_path(const unsigned char *commit_sha1,
-		const char *path);
-void submodule_free(void);
+#define SUBMODULE_INIT { NULL, NULL, NULL, RECURSE_SUBMODULES_NONE, \
+	NULL, NULL, SUBMODULE_UPDATE_STRATEGY_INIT, {0}, -1 };
+
+struct submodule_cache;
+struct repository;
+
+extern void submodule_cache_free(struct submodule_cache *cache);
+
+extern int parse_submodule_fetchjobs(const char *var, const char *value);
+extern int parse_fetch_recurse_submodules_arg(const char *opt, const char *arg);
+struct option;
+extern int option_fetch_parse_recurse_submodules(const struct option *opt,
+						 const char *arg, int unset);
+extern int parse_update_recurse_submodules_arg(const char *opt, const char *arg);
+extern int parse_push_recurse_submodules_arg(const char *opt, const char *arg);
+extern void repo_read_gitmodules(struct repository *repo);
+extern void gitmodules_config_oid(const struct object_id *commit_oid);
+extern const struct submodule *submodule_from_name(
+		const struct object_id *commit_or_tree, const char *name);
+extern const struct submodule *submodule_from_path(
+		const struct object_id *commit_or_tree, const char *path);
+extern const struct submodule *submodule_from_cache(struct repository *repo,
+						    const struct object_id *treeish_name,
+						    const char *key);
+extern void submodule_free(void);
 
 #endif /* SUBMODULE_CONFIG_H */

@@ -32,7 +32,7 @@ static int bisearch(ucs_char_t ucs, const struct interval *table, int max)
 	if (ucs < table[0].first || ucs > table[max].last)
 		return 0;
 	while (max >= min) {
-		mid = (min + max) / 2;
+		mid = min + (max - min) / 2;
 		if (ucs > table[mid].last)
 			min = mid + 1;
 		else if (ucs < table[mid].first)
@@ -381,7 +381,7 @@ void strbuf_utf8_replace(struct strbuf *sb_src, int pos, int width,
 		old = src;
 		n = utf8_width((const char**)&src, NULL);
 		if (!src) 	/* broken utf-8, do nothing */
-			return;
+			goto out;
 		if (n && w >= pos && w < pos + width) {
 			if (subst) {
 				memcpy(dst, subst, subst_len);
@@ -397,6 +397,7 @@ void strbuf_utf8_replace(struct strbuf *sb_src, int pos, int width,
 	}
 	strbuf_setlen(&sb_dst, dst - sb_dst.buf);
 	strbuf_swap(sb_src, &sb_dst);
+out:
 	strbuf_release(&sb_dst);
 }
 
@@ -489,6 +490,28 @@ char *reencode_string_iconv(const char *in, size_t insz, iconv_t conv, int *outs
 	return out;
 }
 
+static const char *fallback_encoding(const char *name)
+{
+	/*
+	 * Some platforms do not have the variously spelled variants of
+	 * UTF-8, so let's fall back to trying the most official
+	 * spelling. We do so only as a fallback in case the platform
+	 * does understand the user's spelling, but not our official
+	 * one.
+	 */
+	if (is_encoding_utf8(name))
+		return "UTF-8";
+
+	/*
+	 * Even though latin-1 is still seen in e-mail
+	 * headers, some platforms only install ISO-8859-1.
+	 */
+	if (!strcasecmp(name, "latin-1"))
+		return "ISO-8859-1";
+
+	return name;
+}
+
 char *reencode_string_len(const char *in, int insz,
 			  const char *out_encoding, const char *in_encoding,
 			  int *outsz)
@@ -501,17 +524,9 @@ char *reencode_string_len(const char *in, int insz,
 
 	conv = iconv_open(out_encoding, in_encoding);
 	if (conv == (iconv_t) -1) {
-		/*
-		 * Some platforms do not have the variously spelled variants of
-		 * UTF-8, so let's fall back to trying the most official
-		 * spelling. We do so only as a fallback in case the platform
-		 * does understand the user's spelling, but not our official
-		 * one.
-		 */
-		if (is_encoding_utf8(in_encoding))
-			in_encoding = "UTF-8";
-		if (is_encoding_utf8(out_encoding))
-			out_encoding = "UTF-8";
+		in_encoding = fallback_encoding(in_encoding);
+		out_encoding = fallback_encoding(out_encoding);
+
 		conv = iconv_open(out_encoding, in_encoding);
 		if (conv == (iconv_t) -1)
 			return NULL;

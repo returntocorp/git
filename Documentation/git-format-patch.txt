@@ -19,9 +19,11 @@ SYNOPSIS
 		   [--start-number <n>] [--numbered-files]
 		   [--in-reply-to=Message-Id] [--suffix=.<sfx>]
 		   [--ignore-if-in-upstream]
-		   [--subject-prefix=Subject-Prefix] [(--reroll-count|-v) <n>]
+		   [--rfc] [--subject-prefix=Subject-Prefix]
+		   [(--reroll-count|-v) <n>]
 		   [--to=<email>] [--cc=<email>]
 		   [--[no-]cover-letter] [--quiet] [--notes[=<ref>]]
+		   [--progress]
 		   [<common diff options>]
 		   [ <since> | <revision range> ]
 
@@ -172,6 +174,11 @@ will want to ensure that threading is disabled for `git send-email`.
 	allows for useful naming of a patch series, and can be
 	combined with the `--numbered` option.
 
+--rfc::
+	Alias for `--subject-prefix="RFC PATCH"`. RFC means "Request For
+	Comments"; use this when sending an experimental patch for
+	discussion rather than application.
+
 -v <n>::
 --reroll-count=<n>::
 	Mark the series as the <n>-th iteration of the topic. The
@@ -233,7 +240,7 @@ keeping them as Git notes allows them to be maintained between versions
 of the patch series (but see the discussion of the `notes.rewrite`
 configuration options in linkgit:git-notes[1] to use this workflow).
 
---[no]-signature=<signature>::
+--[no-]signature=<signature>::
 	Add a signature to each message produced. Per RFC 3676 the signature
 	is separated from the body by a line with '-- ' on it. If the
 	signature option is omitted the signature defaults to the Git version
@@ -276,6 +283,9 @@ you can use `--suffix=-patch` to get `0001-description-of-my-change-patch`.
 	<since>).  Note that root commits included in the specified
 	range are always formatted as creation patches, independently
 	of this flag.
+
+--progress::
+	Show progress reports on stderr as patches are generated.
 
 CONFIGURATION
 -------------
@@ -551,7 +561,7 @@ series A, B, C, the history would be like:
 ................................................
 
 With `git format-patch --base=P -3 C` (or variants thereof, e.g. with
-`--cover-letter` of using `Z..C` instead of `-3 C` to specify the
+`--cover-letter` or using `Z..C` instead of `-3 C` to specify the
 range), the base tree information block is shown at the end of the
 first message the command outputs (either the first patch, or the
 cover letter), like this:

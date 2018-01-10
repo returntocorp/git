@@ -44,8 +44,8 @@ int try_merge_command(const char *strategy, size_t xopts_nr,
 	return ret;
 }
 
-int checkout_fast_forward(const unsigned char *head,
-			  const unsigned char *remote,
+int checkout_fast_forward(const struct object_id *head,
+			  const struct object_id *remote,
 			  int overwrite_ignore)
 {
 	struct tree *trees[MAX_UNPACK_TREES];
@@ -53,11 +53,12 @@ int checkout_fast_forward(const unsigned char *head,
 	struct tree_desc t[MAX_UNPACK_TREES];
 	int i, nr_trees = 0;
 	struct dir_struct dir;
-	struct lock_file *lock_file = xcalloc(1, sizeof(struct lock_file));
+	struct lock_file lock_file = LOCK_INIT;
 
 	refresh_cache(REFRESH_QUIET);
 
-	hold_locked_index(lock_file, 1);
+	if (hold_locked_index(&lock_file, LOCK_REPORT_ON_ERROR) < 0)
+		return -1;
 
 	memset(&trees, 0, sizeof(trees));
 	memset(&opts, 0, sizeof(opts));
@@ -90,7 +91,7 @@ int checkout_fast_forward(const unsigned char *head,
 	}
 	if (unpack_trees(nr_trees, t, &opts))
 		return -1;
-	if (write_locked_index(&the_index, lock_file, COMMIT_LOCK))
-		die(_("unable to write new index file"));
+	if (write_locked_index(&the_index, &lock_file, COMMIT_LOCK))
+		return error(_("unable to write new index file"));
 	return 0;
 }

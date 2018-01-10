@@ -42,6 +42,7 @@ test_decode_color () {
 		function name(n) {
 			if (n == 0) return "RESET";
 			if (n == 1) return "BOLD";
+			if (n == 7) return "REVERSE";
 			if (n == 30) return "BLACK";
 			if (n == 31) return "RED";
 			if (n == 32) return "GREEN";
@@ -79,6 +80,10 @@ test_decode_color () {
 			print
 		}
 	'
+}
+
+lf_to_nul () {
+	perl -pe 'y/\012/\000/'
 }
 
 nul_to_q () {
@@ -132,17 +137,12 @@ test_tick () {
 	export GIT_COMMITTER_DATE GIT_AUTHOR_DATE
 }
 
-# Stop execution and start a shell. This is useful for debugging tests and
-# only makes sense together with "-v".
+# Stop execution and start a shell. This is useful for debugging tests.
 #
 # Be sure to remove all invocations of this command before submitting.
 
 test_pause () {
-	if test "$verbose" = t; then
-		"$SHELL_PATH" <&6 >&3 2>&4
-	else
-		error >&5 "test_pause requires --verbose"
-	fi
+	"$SHELL_PATH" <&6 >&5 2>&7
 }
 
 # Wrap git in gdb. Adding this to a command can make it easier to
@@ -150,19 +150,24 @@ test_pause () {
 #
 # Example: "debug git checkout master".
 debug () {
-	 GIT_TEST_GDB=1 "$@"
+	 GIT_TEST_GDB=1 "$@" <&6 >&5 2>&7
 }
 
-# Call test_commit with the arguments "<message> [<file> [<contents> [<tag>]]]"
+# Call test_commit with the arguments
+# [-C <directory>] <message> [<file> [<contents> [<tag>]]]"
 #
 # This will commit a file with the given contents and the given commit
 # message, and tag the resulting commit with the given tag name.
 #
 # <file>, <contents>, and <tag> all default to <message>.
+#
+# If the first argument is "-C", the second argument is used as a path for
+# the git invocations.
 
 test_commit () {
 	notick= &&
 	signoff= &&
+	indir= &&
 	while test $# != 0
 	do
 		case "$1" in
@@ -172,21 +177,26 @@ test_commit () {
 		--signoff)
 			signoff="$1"
 			;;
+		-C)
+			indir="$2"
+			shift
+			;;
 		*)
 			break
 			;;
 		esac
 		shift
 	done &&
+	indir=${indir:+"$indir"/} &&
 	file=${2:-"$1.t"} &&
-	echo "${3-$1}" > "$file" &&
-	git add "$file" &&
+	echo "${3-$1}" > "$indir$file" &&
+	git ${indir:+ -C "$indir"} add "$file" &&
 	if test -z "$notick"
 	then
 		test_tick
 	fi &&
-	git commit $signoff -m "$1" &&
-	git tag "${4:-$1}"
+	git ${indir:+ -C "$indir"} commit $signoff -m "$1" &&
+	git ${indir:+ -C "$indir"} tag "${4:-$1}"
 }
 
 # Call test_merge with the arguments "<message> <commit>", where <commit>
@@ -205,6 +215,11 @@ test_merge () {
 test_chmod () {
 	chmod "$@" &&
 	git update-index --add "--chmod=$@"
+}
+
+# Get the modebits from a file.
+test_modebits () {
+	ls -l "$1" | sed -e 's|^\(..........\).*|\1|'
 }
 
 # Unset a configuration variable, but don't fail if it doesn't exist.
@@ -975,4 +990,33 @@ test_match_signal () {
 		return 0
 	fi
 	return 1
+}
+
+# Read up to "$1" bytes (or to EOF) from stdin and write them to stdout.
+test_copy_bytes () {
+	perl -e '
+		my $len = $ARGV[1];
+		while ($len > 0) {
+			my $s;
+			my $nread = sysread(STDIN, $s, $len);
+			die "cannot read: $!" unless defined($nread);
+			last unless $nread;
+			print $s;
+			$len -= $nread;
+		}
+	' - "$1"
+}
+
+# run "$@" inside a non-git directory
+nongit () {
+	test -d non-repo ||
+	mkdir non-repo ||
+	return 1
+
+	(
+		GIT_CEILING_DIRECTORIES=$(pwd) &&
+		export GIT_CEILING_DIRECTORIES &&
+		cd non-repo &&
+		"$@"
+	)
 }

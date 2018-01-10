@@ -6,8 +6,7 @@
 #include "csum-file.h"
 #include "pack.h"
 #include "strbuf.h"
-
-static int pack_compression_level = Z_DEFAULT_COMPRESSION;
+#include "packfile.h"
 
 static struct bulk_checkin_state {
 	unsigned plugged:1;
@@ -71,7 +70,7 @@ static int already_written(struct bulk_checkin_state *state, unsigned char sha1[
 
 	/* Might want to keep the list sorted */
 	for (i = 0; i < state->nr_written; i++)
-		if (!hashcmp(state->written[i]->sha1, sha1))
+		if (!hashcmp(state->written[i]->oid.hash, sha1))
 			return 1;
 
 	/* This is a new object we need to keep */
@@ -107,7 +106,7 @@ static int stream_to_pack(struct bulk_checkin_state *state,
 
 	git_deflate_init(&s, pack_compression_level);
 
-	hdrlen = encode_in_pack_object_header(type, size, obuf);
+	hdrlen = encode_in_pack_object_header(obuf, sizeof(obuf), type, size);
 	s.next_out = obuf + hdrlen;
 	s.avail_out = sizeof(obuf) - hdrlen;
 
@@ -116,7 +115,10 @@ static int stream_to_pack(struct bulk_checkin_state *state,
 
 		if (size && !s.avail_in) {
 			ssize_t rsize = size < sizeof(ibuf) ? size : sizeof(ibuf);
-			if (read_in_full(fd, ibuf, rsize) != rsize)
+			ssize_t read_result = read_in_full(fd, ibuf, rsize);
+			if (read_result < 0)
+				die_errno("failed to read from '%s'", path);
+			if (read_result != rsize)
 				die("failed to read %d bytes from '%s'",
 				    (int)rsize, path);
 			offset += rsize;
@@ -244,7 +246,7 @@ static int deflate_to_pack(struct bulk_checkin_state *state,
 		state->offset = checkpoint.offset;
 		free(idx);
 	} else {
-		hashcpy(idx->sha1, result_sha1);
+		hashcpy(idx->oid.hash, result_sha1);
 		ALLOC_GROW(state->written,
 			   state->nr_written + 1,
 			   state->alloc_written);

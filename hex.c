@@ -39,16 +39,8 @@ int get_sha1_hex(const char *hex, unsigned char *sha1)
 {
 	int i;
 	for (i = 0; i < GIT_SHA1_RAWSZ; i++) {
-		unsigned int val;
-		/*
-		 * hex[1]=='\0' is caught when val is checked below,
-		 * but if hex[0] is NUL we have to avoid reading
-		 * past the end of the string:
-		 */
-		if (!hex[0])
-			return -1;
-		val = (hexval(hex[0]) << 4) | hexval(hex[1]);
-		if (val & ~0xff)
+		int val = hex2chr(hex);
+		if (val < 0)
 			return -1;
 		*sha1++ = val;
 		hex += 2;
@@ -59,6 +51,14 @@ int get_sha1_hex(const char *hex, unsigned char *sha1)
 int get_oid_hex(const char *hex, struct object_id *oid)
 {
 	return get_sha1_hex(hex, oid->hash);
+}
+
+int parse_oid_hex(const char *hex, struct object_id *oid, const char **end)
+{
+	int ret = get_oid_hex(hex, oid);
+	if (!ret)
+		*end = hex + GIT_SHA1_HEXSZ;
+	return ret;
 }
 
 char *sha1_to_hex_r(char *buffer, const unsigned char *sha1)
@@ -77,11 +77,17 @@ char *sha1_to_hex_r(char *buffer, const unsigned char *sha1)
 	return buffer;
 }
 
+char *oid_to_hex_r(char *buffer, const struct object_id *oid)
+{
+	return sha1_to_hex_r(buffer, oid->hash);
+}
+
 char *sha1_to_hex(const unsigned char *sha1)
 {
 	static int bufno;
-	static char hexbuffer[4][GIT_SHA1_HEXSZ + 1];
-	return sha1_to_hex_r(hexbuffer[3 & ++bufno], sha1);
+	static char hexbuffer[4][GIT_MAX_HEXSZ + 1];
+	bufno = (bufno + 1) % ARRAY_SIZE(hexbuffer);
+	return sha1_to_hex_r(hexbuffer[bufno], sha1);
 }
 
 char *oid_to_hex(const struct object_id *oid)

@@ -71,6 +71,16 @@ test_expect_success "fetch --recurse-submodules recurses into submodules" '
 	test_i18ncmp expect.err actual.err
 '
 
+test_expect_success "submodule.recurse option triggers recursive fetch" '
+	add_upstream_commit &&
+	(
+		cd downstream &&
+		git -c submodule.recurse fetch >../actual.out 2>../actual.err
+	) &&
+	test_must_be_empty actual.out &&
+	test_i18ncmp expect.err actual.err
+'
+
 test_expect_success "fetch --recurse-submodules -j2 has the same output behaviour" '
 	add_upstream_commit &&
 	(
@@ -183,7 +193,7 @@ test_expect_success "recurseSubmodules=true propagates into submodules" '
 	add_upstream_commit &&
 	(
 		cd downstream &&
-		git config fetch.recurseSubmodules true
+		git config fetch.recurseSubmodules true &&
 		git fetch >../actual.out 2>../actual.err
 	) &&
 	test_must_be_empty actual.out &&
@@ -208,7 +218,7 @@ test_expect_success "--no-recurse-submodules overrides config setting" '
 	add_upstream_commit &&
 	(
 		cd downstream &&
-		git config fetch.recurseSubmodules true
+		git config fetch.recurseSubmodules true &&
 		git fetch --no-recurse-submodules >../actual.out 2>../actual.err
 	) &&
 	! test -s actual.out &&
@@ -222,7 +232,7 @@ test_expect_success "Recursion doesn't happen when no new commits are fetched in
 			cd submodule &&
 			git config --unset fetch.recurseSubmodules
 		) &&
-		git config --unset fetch.recurseSubmodules
+		git config --unset fetch.recurseSubmodules &&
 		git fetch >../actual.out 2>../actual.err
 	) &&
 	! test -s actual.out &&
@@ -302,7 +312,7 @@ test_expect_success "Recursion picks up all submodules when necessary" '
 		) &&
 		head1=$(git rev-parse --short HEAD^) &&
 		git add subdir/deepsubmodule &&
-		git commit -m "new deepsubmodule"
+		git commit -m "new deepsubmodule" &&
 		head2=$(git rev-parse --short HEAD) &&
 		echo "Fetching submodule submodule" > ../expect.err.sub &&
 		echo "From $pwd/submodule" >> ../expect.err.sub &&
@@ -468,7 +478,47 @@ test_expect_success "don't fetch submodule when newly recorded commits are alrea
 		git fetch >../actual.out 2>../actual.err
 	) &&
 	! test -s actual.out &&
-	test_i18ncmp expect.err actual.err
+	test_i18ncmp expect.err actual.err &&
+	(
+		cd submodule &&
+		git checkout -q master
+	)
+'
+
+test_expect_success "'fetch.recurseSubmodules=on-demand' works also without .gitmodule entry" '
+	(
+		cd downstream &&
+		git fetch --recurse-submodules
+	) &&
+	add_upstream_commit &&
+	head1=$(git rev-parse --short HEAD) &&
+	git add submodule &&
+	git rm .gitmodules &&
+	git commit -m "new submodule without .gitmodules" &&
+	printf "" >expect.out &&
+	head2=$(git rev-parse --short HEAD) &&
+	echo "From $pwd/." >expect.err.2 &&
+	echo "   $head1..$head2  master     -> origin/master" >>expect.err.2 &&
+	head -3 expect.err >>expect.err.2 &&
+	(
+		cd downstream &&
+		rm .gitmodules &&
+		git config fetch.recurseSubmodules on-demand &&
+		# fake submodule configuration to avoid skipping submodule handling
+		git config -f .gitmodules submodule.fake.path fake &&
+		git config -f .gitmodules submodule.fake.url fakeurl &&
+		git add .gitmodules &&
+		git config --unset submodule.submodule.url &&
+		git fetch >../actual.out 2>../actual.err &&
+		# cleanup
+		git config --unset fetch.recurseSubmodules &&
+		git reset --hard
+	) &&
+	test_i18ncmp expect.out actual.out &&
+	test_i18ncmp expect.err.2 actual.err &&
+	git checkout HEAD^ -- .gitmodules &&
+	git add .gitmodules &&
+	git commit -m "new submodule restored .gitmodules"
 '
 
 test_expect_success 'fetching submodules respects parallel settings' '
@@ -483,6 +533,76 @@ test_expect_success 'fetching submodules respects parallel settings' '
 		GIT_TRACE=$(pwd)/trace.out git fetch --jobs 9 &&
 		grep "9 tasks" trace.out
 	)
+'
+
+test_expect_success 'fetching submodule into a broken repository' '
+	# Prepare src and src/sub nested in it
+	git init src &&
+	(
+		cd src &&
+		git init sub &&
+		git -C sub commit --allow-empty -m "initial in sub" &&
+		git submodule add -- ./sub sub &&
+		git commit -m "initial in top"
+	) &&
+
+	# Clone the old-fashoned way
+	git clone src dst &&
+	git -C dst clone ../src/sub sub &&
+
+	# Make sure that old-fashoned layout is still supported
+	git -C dst status &&
+
+	# "diff" would find no change
+	git -C dst diff --exit-code &&
+
+	# Recursive-fetch works fine
+	git -C dst fetch --recurse-submodules &&
+
+	# Break the receiving submodule
+	rm -f dst/sub/.git/HEAD &&
+
+	# NOTE: without the fix the following tests will recurse forever!
+	# They should terminate with an error.
+
+	test_must_fail git -C dst status &&
+	test_must_fail git -C dst diff &&
+	test_must_fail git -C dst fetch --recurse-submodules
+'
+
+test_expect_success "fetch new commits when submodule got renamed" '
+	git clone . downstream_rename &&
+	(
+		cd downstream_rename &&
+		git submodule update --init &&
+# NEEDSWORK: we omitted --recursive for the submodule update here since
+# that does not work. See test 7001 for mv "moving nested submodules"
+# for details. Once that is fixed we should add the --recursive option
+# here.
+		git checkout -b rename &&
+		git mv submodule submodule_renamed &&
+		(
+			cd submodule_renamed &&
+			git checkout -b rename_sub &&
+			echo a >a &&
+			git add a &&
+			git commit -ma &&
+			git push origin rename_sub &&
+			git rev-parse HEAD >../../expect
+		) &&
+		git add submodule_renamed &&
+		git commit -m "update renamed submodule" &&
+		git push origin rename
+	) &&
+	(
+		cd downstream &&
+		git fetch --recurse-submodules=on-demand &&
+		(
+			cd submodule &&
+			git rev-parse origin/rename_sub >../../actual
+		)
+	) &&
+	test_cmp expect actual
 '
 
 test_done

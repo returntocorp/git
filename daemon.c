@@ -1,12 +1,9 @@
 #include "cache.h"
+#include "config.h"
 #include "pkt-line.h"
 #include "run-command.h"
 #include "strbuf.h"
 #include "string-list.h"
-
-#ifndef HOST_NAME_MAX
-#define HOST_NAME_MAX 256
-#endif
 
 #ifdef NO_INITGROUPS
 #define initgroups(x, y) (0) /* nothing */
@@ -160,6 +157,7 @@ static const char *path_ok(const char *directory, struct hostinfo *hi)
 {
 	static char rpath[PATH_MAX];
 	static char interp_path[PATH_MAX];
+	size_t rlen;
 	const char *path;
 	const char *dir;
 
@@ -187,8 +185,12 @@ static const char *path_ok(const char *directory, struct hostinfo *hi)
 			namlen = slash - dir;
 			restlen -= namlen;
 			loginfo("userpath <%s>, request <%s>, namlen %d, restlen %d, slash <%s>", user_path, dir, namlen, restlen, slash);
-			snprintf(rpath, PATH_MAX, "%.*s/%s%.*s",
-				 namlen, dir, user_path, restlen, slash);
+			rlen = snprintf(rpath, sizeof(rpath), "%.*s/%s%.*s",
+					namlen, dir, user_path, restlen, slash);
+			if (rlen >= sizeof(rpath)) {
+				logerror("user-path too large: %s", rpath);
+				return NULL;
+			}
 			dir = rpath;
 		}
 	}
@@ -207,7 +209,15 @@ static const char *path_ok(const char *directory, struct hostinfo *hi)
 
 		strbuf_expand(&expanded_path, interpolated_path,
 			      expand_path, &context);
-		strlcpy(interp_path, expanded_path.buf, PATH_MAX);
+
+		rlen = strlcpy(interp_path, expanded_path.buf,
+			       sizeof(interp_path));
+		if (rlen >= sizeof(interp_path)) {
+			logerror("interpolated path too large: %s",
+				 interp_path);
+			return NULL;
+		}
+
 		strbuf_release(&expanded_path);
 		loginfo("Interpolated dir '%s'", interp_path);
 
@@ -219,7 +229,11 @@ static const char *path_ok(const char *directory, struct hostinfo *hi)
 			logerror("'%s': Non-absolute path denied (base-path active)", dir);
 			return NULL;
 		}
-		snprintf(rpath, PATH_MAX, "%s%s", base_path, dir);
+		rlen = snprintf(rpath, sizeof(rpath), "%s%s", base_path, dir);
+		if (rlen >= sizeof(rpath)) {
+			logerror("base-path too large: %s", rpath);
+			return NULL;
+		}
 		dir = rpath;
 	}
 
@@ -281,7 +295,7 @@ static int daemon_error(const char *dir, const char *msg)
 {
 	if (!informative_errors)
 		msg = "access denied or repository not exported";
-	packet_write(1, "ERR %s: %s", msg, dir);
+	packet_write_fmt(1, "ERR %s: %s", msg, dir);
 	return -1;
 }
 
@@ -432,46 +446,42 @@ static void copy_to_log(int fd)
 	fclose(fp);
 }
 
-static int run_service_command(const char **argv)
+static int run_service_command(struct child_process *cld)
 {
-	struct child_process cld = CHILD_PROCESS_INIT;
-
-	cld.argv = argv;
-	cld.git_cmd = 1;
-	cld.err = -1;
-	if (start_command(&cld))
+	argv_array_push(&cld->args, ".");
+	cld->git_cmd = 1;
+	cld->err = -1;
+	if (start_command(cld))
 		return -1;
 
 	close(0);
 	close(1);
 
-	copy_to_log(cld.err);
+	copy_to_log(cld->err);
 
-	return finish_command(&cld);
+	return finish_command(cld);
 }
 
 static int upload_pack(void)
 {
-	/* Timeout as string */
-	char timeout_buf[64];
-	const char *argv[] = { "upload-pack", "--strict", NULL, ".", NULL };
-
-	argv[2] = timeout_buf;
-
-	snprintf(timeout_buf, sizeof timeout_buf, "--timeout=%u", timeout);
-	return run_service_command(argv);
+	struct child_process cld = CHILD_PROCESS_INIT;
+	argv_array_pushl(&cld.args, "upload-pack", "--strict", NULL);
+	argv_array_pushf(&cld.args, "--timeout=%u", timeout);
+	return run_service_command(&cld);
 }
 
 static int upload_archive(void)
 {
-	static const char *argv[] = { "upload-archive", ".", NULL };
-	return run_service_command(argv);
+	struct child_process cld = CHILD_PROCESS_INIT;
+	argv_array_push(&cld.args, "upload-archive");
+	return run_service_command(&cld);
 }
 
 static int receive_pack(void)
 {
-	static const char *argv[] = { "receive-pack", ".", NULL };
-	return run_service_command(argv);
+	struct child_process cld = CHILD_PROCESS_INIT;
+	argv_array_push(&cld.args, "receive-pack");
+	return run_service_command(&cld);
 }
 
 static struct daemon_service daemon_service[] = {

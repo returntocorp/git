@@ -292,8 +292,8 @@ test_expect_success 'setup submodule' '
 	echo content >file &&
 	git add file &&
 	git commit -m "added sub and file" &&
-	mkdir -p deep/directory/hierachy &&
-	git submodule add ./. deep/directory/hierachy/sub &&
+	mkdir -p deep/directory/hierarchy &&
+	git submodule add ./. deep/directory/hierarchy/sub &&
 	git commit -m "added another submodule" &&
 	git branch submodule
 '
@@ -485,10 +485,35 @@ test_expect_success 'moving a submodule in nested directories' '
 		# git status would fail if the update of linking git dir to
 		# work dir of the submodule failed.
 		git status &&
-		git config -f ../.gitmodules submodule.deep/directory/hierachy/sub.path >../actual &&
-		echo "directory/hierachy/sub" >../expect
+		git config -f ../.gitmodules submodule.deep/directory/hierarchy/sub.path >../actual &&
+		echo "directory/hierarchy/sub" >../expect
 	) &&
-	test_cmp actual expect
+	test_cmp expect actual
+'
+
+test_expect_failure 'moving nested submodules' '
+	git commit -am "cleanup commit" &&
+	mkdir sub_nested_nested &&
+	(cd sub_nested_nested &&
+		touch nested_level2 &&
+		git init &&
+		git add . &&
+		git commit -m "nested level 2"
+	) &&
+	mkdir sub_nested &&
+	(cd sub_nested &&
+		touch nested_level1 &&
+		git init &&
+		git add . &&
+		git commit -m "nested level 1"
+		git submodule add ../sub_nested_nested &&
+		git commit -m "add nested level 2"
+	) &&
+	git submodule add ./sub_nested nested_move &&
+	git commit -m "add nested_move" &&
+	git submodule update --init --recursive &&
+	git mv nested_move sub_nested_moved &&
+	git status
 '
 
 test_done

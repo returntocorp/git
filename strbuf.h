@@ -68,7 +68,7 @@ struct strbuf {
 };
 
 extern char strbuf_slopbuf[];
-#define STRBUF_INIT  { 0, 0, strbuf_slopbuf }
+#define STRBUF_INIT  { .alloc = 0, .len = 0, .buf = strbuf_slopbuf }
 
 /**
  * Life Cycle Functions
@@ -82,8 +82,12 @@ extern char strbuf_slopbuf[];
 extern void strbuf_init(struct strbuf *, size_t);
 
 /**
- * Release a string buffer and the memory it used. You should not use the
- * string buffer after using this function, unless you initialize it again.
+ * Release a string buffer and the memory it used. After this call, the
+ * strbuf points to an empty string that does not need to be free()ed, as
+ * if it had been set to `STRBUF_INIT` and never modified.
+ *
+ * To clear a strbuf in preparation for further use without the overhead
+ * of free()ing and malloc()ing again, use strbuf_reset() instead.
  */
 extern void strbuf_release(struct strbuf *);
 
@@ -91,6 +95,9 @@ extern void strbuf_release(struct strbuf *);
  * Detach the string from the strbuf and returns it; you now own the
  * storage the string occupies and it is your responsibility from then on
  * to release it with `free(3)` when you are done with it.
+ *
+ * The strbuf that previously held the string is reset to `STRBUF_INIT` so
+ * it can be reused after calling this function.
  */
 extern char *strbuf_detach(struct strbuf *, size_t *);
 
@@ -109,9 +116,7 @@ extern void strbuf_attach(struct strbuf *, void *, size_t, size_t);
  */
 static inline void strbuf_swap(struct strbuf *a, struct strbuf *b)
 {
-	struct strbuf tmp = *a;
-	*a = *b;
-	*b = tmp;
+	SWAP(*a, *b);
 }
 
 
@@ -149,7 +154,10 @@ static inline void strbuf_setlen(struct strbuf *sb, size_t len)
 	if (len > (sb->alloc ? sb->alloc - 1 : 0))
 		die("BUG: strbuf_setlen() beyond buffer");
 	sb->len = len;
-	sb->buf[len] = '\0';
+	if (sb->buf != strbuf_slopbuf)
+		sb->buf[len] = '\0';
+	else
+		assert(!strbuf_slopbuf[0]);
 }
 
 /**
@@ -266,12 +274,6 @@ static inline void strbuf_addstr(struct strbuf *sb, const char *s)
 extern void strbuf_addbuf(struct strbuf *sb, const struct strbuf *sb2);
 
 /**
- * Copy part of the buffer from a given position till a given length to the
- * end of the buffer.
- */
-extern void strbuf_adddup(struct strbuf *sb, size_t pos, size_t len);
-
-/**
  * This function can be used to expand a format string containing
  * placeholders. To that end, it parses the string and calls the specified
  * function for every percent sign found.
@@ -342,8 +344,15 @@ extern void strbuf_vaddf(struct strbuf *sb, const char *fmt, va_list ap);
 
 /**
  * Add the time specified by `tm`, as formatted by `strftime`.
+ * `tz_offset` is in decimal hhmm format, e.g. -600 means six hours west
+ * of Greenwich, and it's used to expand %z internally.  However, tokens
+ * with modifiers (e.g. %Ez) are passed to `strftime`.
+ * `suppress_tz_name`, when set, expands %Z internally to the empty
+ * string rather than passing it to `strftime`.
  */
-extern void strbuf_addftime(struct strbuf *sb, const char *fmt, const struct tm *tm);
+extern void strbuf_addftime(struct strbuf *sb, const char *fmt,
+			    const struct tm *tm, int tz_offset,
+			    int suppress_tz_name);
 
 /**
  * Read a given size of data from a FILE* pointer to the buffer.
@@ -442,6 +451,28 @@ extern int strbuf_getcwd(struct strbuf *sb);
  * resolved.
  */
 extern void strbuf_add_absolute_path(struct strbuf *sb, const char *path);
+
+/**
+ * Canonize `path` (make it absolute, resolve symlinks, remove extra
+ * slashes) and append it to `sb`.  Die with an informative error
+ * message if there is a problem.
+ *
+ * The directory part of `path` (i.e., everything up to the last
+ * dir_sep) must denote a valid, existing directory, but the last
+ * component need not exist.
+ *
+ * Callers that don't mind links should use the more lightweight
+ * strbuf_add_absolute_path() instead.
+ */
+extern void strbuf_add_real_path(struct strbuf *sb, const char *path);
+
+
+/**
+ * Normalize in-place the path contained in the strbuf. See
+ * normalize_path_copy() for details. If an error occurs, the contents of "sb"
+ * are left untouched, and -1 is returned.
+ */
+extern int strbuf_normalize_path(struct strbuf *sb);
 
 /**
  * Strip whitespace from a buffer. The second parameter controls if
@@ -554,7 +585,26 @@ static inline void strbuf_complete_line(struct strbuf *sb)
 	strbuf_complete(sb, '\n');
 }
 
-extern int strbuf_branchname(struct strbuf *sb, const char *name);
+/*
+ * Copy "name" to "sb", expanding any special @-marks as handled by
+ * interpret_branch_name(). The result is a non-qualified branch name
+ * (so "foo" or "origin/master" instead of "refs/heads/foo" or
+ * "refs/remotes/origin/master").
+ *
+ * Note that the resulting name may not be a syntactically valid refname.
+ *
+ * If "allowed" is non-zero, restrict the set of allowed expansions. See
+ * interpret_branch_name() for details.
+ */
+extern void strbuf_branchname(struct strbuf *sb, const char *name,
+			      unsigned allowed);
+
+/*
+ * Like strbuf_branchname() above, but confirm that the result is
+ * syntactically valid to be used as a local branch name in refs/heads/.
+ *
+ * The return value is "0" if the result is valid, and "-1" otherwise.
+ */
 extern int strbuf_check_branch_ref(struct strbuf *sb, const char *name);
 
 extern void strbuf_addstr_urlencode(struct strbuf *, const char *,

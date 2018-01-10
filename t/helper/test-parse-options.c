@@ -5,14 +5,14 @@
 static int boolean = 0;
 static int integer = 0;
 static unsigned long magnitude = 0;
-static unsigned long timestamp;
+static timestamp_t timestamp;
 static int abbrev = 7;
 static int verbose = -1; /* unspecified */
 static int dry_run = 0, quiet = 0;
 static char *string = NULL;
 static char *file = NULL;
 static int ambiguous;
-static struct string_list list;
+static struct string_list list = STRING_LIST_INIT_NODUP;
 
 static struct {
 	int called;
@@ -99,6 +99,8 @@ int cmd_main(int argc, const char **argv)
 	const char *prefix = "prefix/";
 	const char *usage[] = {
 		"test-parse-options <options>",
+		"",
+		"A helper function for the parse-options API.",
 		NULL
 	};
 	struct string_list expect = STRING_LIST_INIT_NODUP;
@@ -161,7 +163,7 @@ int cmd_main(int argc, const char **argv)
 	show(&expect, &ret, "boolean: %d", boolean);
 	show(&expect, &ret, "integer: %d", integer);
 	show(&expect, &ret, "magnitude: %lu", magnitude);
-	show(&expect, &ret, "timestamp: %lu", timestamp);
+	show(&expect, &ret, "timestamp: %"PRItime, timestamp);
 	show(&expect, &ret, "string: %s", string ? string : "(not set)");
 	show(&expect, &ret, "abbrev: %d", abbrev);
 	show(&expect, &ret, "verbose: %d", verbose);

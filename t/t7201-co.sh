@@ -187,7 +187,7 @@ test_expect_success 'format of merge conflict from checkout -m' '
 	d
 	>>>>>>> local
 	EOF
-	test_cmp two expect
+	test_cmp expect two
 '
 
 test_expect_success 'checkout --merge --conflict=diff3 <branch>' '
@@ -213,7 +213,7 @@ test_expect_success 'checkout --merge --conflict=diff3 <branch>' '
 	d
 	>>>>>>> local
 	EOF
-	test_cmp two expect
+	test_cmp expect two
 '
 
 test_expect_success 'switch to another branch while carrying a deletion' '
@@ -257,7 +257,7 @@ test_expect_success 'checkout to detach HEAD' '
 	git checkout -f renamer && git clean -f &&
 	git checkout renamer^ 2>messages &&
 	test_i18ngrep "HEAD is now at 7329388" messages &&
-	test_line_count -gt 1 messages &&
+	(test_line_count -gt 1 messages || test -n "$GETTEXT_POISON") &&
 	H=$(git rev-parse --verify HEAD) &&
 	M=$(git show-ref -s --verify refs/heads/master) &&
 	test "z$H" = "z$M" &&

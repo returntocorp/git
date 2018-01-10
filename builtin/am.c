@@ -4,6 +4,7 @@
  * Based on git-am.sh by Junio C Hamano.
  */
 #include "cache.h"
+#include "config.h"
 #include "builtin.h"
 #include "exec_cmd.h"
 #include "parse-options.h"
@@ -28,6 +29,9 @@
 #include "rerere.h"
 #include "prompt.h"
 #include "mailinfo.h"
+#include "apply.h"
+#include "string-list.h"
+#include "packfile.h"
 
 /**
  * Returns 1 if the file is empty or does not exist, 0 otherwise.
@@ -70,7 +74,8 @@ enum patch_format {
 	PATCH_FORMAT_MBOX,
 	PATCH_FORMAT_STGIT,
 	PATCH_FORMAT_STGIT_SERIES,
-	PATCH_FORMAT_HG
+	PATCH_FORMAT_HG,
+	PATCH_FORMAT_MBOXRD
 };
 
 enum keep_type {
@@ -107,7 +112,7 @@ struct am_state {
 	size_t msg_len;
 
 	/* when --rebasing, records the original commit the patch came from */
-	unsigned char orig_commit[GIT_SHA1_RAWSZ];
+	struct object_id orig_commit;
 
 	/* number of digits in patch filename */
 	int prec;
@@ -131,17 +136,15 @@ struct am_state {
 };
 
 /**
- * Initializes am_state with the default values. The state directory is set to
- * dir.
+ * Initializes am_state with the default values.
  */
-static void am_state_init(struct am_state *state, const char *dir)
+static void am_state_init(struct am_state *state)
 {
 	int gpgsign;
 
 	memset(state, 0, sizeof(*state));
 
-	assert(dir);
-	state->dir = xstrdup(dir);
+	state->dir = git_pathdup("rebase-apply");
 
 	state->prec = 4;
 
@@ -183,22 +186,22 @@ static inline const char *am_path(const struct am_state *state, const char *path
 /**
  * For convenience to call write_file()
  */
-static int write_state_text(const struct am_state *state,
-			    const char *name, const char *string)
+static void write_state_text(const struct am_state *state,
+			     const char *name, const char *string)
 {
-	return write_file(am_path(state, name), "%s", string);
+	write_file(am_path(state, name), "%s", string);
 }
 
-static int write_state_count(const struct am_state *state,
+static void write_state_count(const struct am_state *state,
+			      const char *name, int value)
+{
+	write_file(am_path(state, name), "%d", value);
+}
+
+static void write_state_bool(const struct am_state *state,
 			     const char *name, int value)
 {
-	return write_file(am_path(state, name), "%d", value);
-}
-
-static int write_state_bool(const struct am_state *state,
-			    const char *name, int value)
-{
-	return write_state_text(state, name, value ? "t" : "f");
+	write_state_text(state, name, value ? "t" : "f");
 }
 
 /**
@@ -257,38 +260,29 @@ static int read_state_file(struct strbuf *sb, const struct am_state *state,
 }
 
 /**
- * Reads a KEY=VALUE shell variable assignment from `fp`, returning the VALUE
- * as a newly-allocated string. VALUE must be a quoted string, and the KEY must
- * match `key`. Returns NULL on failure.
- *
- * This is used by read_author_script() to read the GIT_AUTHOR_* variables from
- * the author-script.
+ * Take a series of KEY='VALUE' lines where VALUE part is
+ * sq-quoted, and append <KEY, VALUE> at the end of the string list
  */
-static char *read_shell_var(FILE *fp, const char *key)
+static int parse_key_value_squoted(char *buf, struct string_list *list)
 {
-	struct strbuf sb = STRBUF_INIT;
-	const char *str;
+	while (*buf) {
+		struct string_list_item *item;
+		char *np;
+		char *cp = strchr(buf, '=');
+		if (!cp)
+			return -1;
+		np = strchrnul(cp, '\n');
+		*cp++ = '\0';
+		item = string_list_append(list, buf);
 
-	if (strbuf_getline_lf(&sb, fp))
-		goto fail;
-
-	if (!skip_prefix(sb.buf, key, &str))
-		goto fail;
-
-	if (!skip_prefix(str, "=", &str))
-		goto fail;
-
-	strbuf_remove(&sb, 0, str - sb.buf);
-
-	str = sq_dequote(sb.buf);
-	if (!str)
-		goto fail;
-
-	return strbuf_detach(&sb, NULL);
-
-fail:
-	strbuf_release(&sb);
-	return NULL;
+		buf = np + (*np == '\n');
+		*np = '\0';
+		cp = sq_dequote(cp);
+		if (!cp)
+			return -1;
+		item->util = xstrdup(cp);
+	}
+	return 0;
 }
 
 /**
@@ -310,44 +304,39 @@ fail:
 static int read_author_script(struct am_state *state)
 {
 	const char *filename = am_path(state, "author-script");
-	FILE *fp;
+	struct strbuf buf = STRBUF_INIT;
+	struct string_list kv = STRING_LIST_INIT_DUP;
+	int retval = -1; /* assume failure */
+	int fd;
 
 	assert(!state->author_name);
 	assert(!state->author_email);
 	assert(!state->author_date);
 
-	fp = fopen(filename, "r");
-	if (!fp) {
+	fd = open(filename, O_RDONLY);
+	if (fd < 0) {
 		if (errno == ENOENT)
 			return 0;
 		die_errno(_("could not open '%s' for reading"), filename);
 	}
+	strbuf_read(&buf, fd, 0);
+	close(fd);
+	if (parse_key_value_squoted(buf.buf, &kv))
+		goto finish;
 
-	state->author_name = read_shell_var(fp, "GIT_AUTHOR_NAME");
-	if (!state->author_name) {
-		fclose(fp);
-		return -1;
-	}
-
-	state->author_email = read_shell_var(fp, "GIT_AUTHOR_EMAIL");
-	if (!state->author_email) {
-		fclose(fp);
-		return -1;
-	}
-
-	state->author_date = read_shell_var(fp, "GIT_AUTHOR_DATE");
-	if (!state->author_date) {
-		fclose(fp);
-		return -1;
-	}
-
-	if (fgetc(fp) != EOF) {
-		fclose(fp);
-		return -1;
-	}
-
-	fclose(fp);
-	return 0;
+	if (kv.nr != 3 ||
+	    strcmp(kv.items[0].string, "GIT_AUTHOR_NAME") ||
+	    strcmp(kv.items[1].string, "GIT_AUTHOR_EMAIL") ||
+	    strcmp(kv.items[2].string, "GIT_AUTHOR_DATE"))
+		goto finish;
+	state->author_name = kv.items[0].util;
+	state->author_email = kv.items[1].util;
+	state->author_date = kv.items[2].util;
+	retval = 0;
+finish:
+	string_list_clear(&kv, !!retval);
+	strbuf_release(&buf);
+	return retval;
 }
 
 /**
@@ -402,13 +391,8 @@ static int read_commit_msg(struct am_state *state)
  */
 static void write_commit_msg(const struct am_state *state)
 {
-	int fd;
 	const char *filename = am_path(state, "final-commit");
-
-	fd = xopen(filename, O_WRONLY | O_CREAT, 0666);
-	if (write_in_full(fd, state->msg, state->msg_len) < 0)
-		die_errno(_("could not write to %s"), filename);
-	close(fd);
+	write_file_buf(filename, state->msg, state->msg_len);
 }
 
 /**
@@ -432,8 +416,8 @@ static void am_load(struct am_state *state)
 	read_commit_msg(state);
 
 	if (read_state_file(&sb, state, "original-commit", 1) < 0)
-		hashclr(state->orig_commit);
-	else if (get_sha1_hex(sb.buf, state->orig_commit) < 0)
+		oidclr(&state->orig_commit);
+	else if (get_oid_hex(sb.buf, &state->orig_commit) < 0)
 		die(_("could not parse %s"), am_path(state, "original-commit"));
 
 	read_state_file(&sb, state, "threeway", 1);
@@ -447,6 +431,14 @@ static void am_load(struct am_state *state)
 
 	read_state_file(&sb, state, "utf8", 1);
 	state->utf8 = !strcmp(sb.buf, "t");
+
+	if (file_exists(am_path(state, "rerere-autoupdate"))) {
+		read_state_file(&sb, state, "rerere-autoupdate", 1);
+		state->allow_rerere_autoupdate = strcmp(sb.buf, "t") ?
+			RERERE_NOAUTOUPDATE : RERERE_AUTOUPDATE;
+	} else {
+		state->allow_rerere_autoupdate = 0;
+	}
 
 	read_state_file(&sb, state, "keep", 1);
 	if (!strcmp(sb.buf, "t"))
@@ -501,8 +493,7 @@ static int run_applypatch_msg_hook(struct am_state *state)
 	ret = run_hook_le(NULL, "applypatch-msg", am_path(state, "final-commit"), NULL);
 
 	if (!ret) {
-		free(state->msg);
-		state->msg = NULL;
+		FREE_AND_NULL(state->msg);
 		if (read_commit_msg(state) < 0)
 			die(_("'%s' was deleted by the applypatch-msg hook"),
 				am_path(state, "final-commit"));
@@ -559,14 +550,14 @@ static int copy_notes_for_rebase(const struct am_state *state)
 	fp = xfopen(am_path(state, "rewritten"), "r");
 
 	while (!strbuf_getline_lf(&sb, fp)) {
-		unsigned char from_obj[GIT_SHA1_RAWSZ], to_obj[GIT_SHA1_RAWSZ];
+		struct object_id from_obj, to_obj;
 
 		if (sb.len != GIT_SHA1_HEXSZ * 2 + 1) {
 			ret = error(invalid_line, sb.buf);
 			goto finish;
 		}
 
-		if (get_sha1_hex(sb.buf, from_obj)) {
+		if (get_oid_hex(sb.buf, &from_obj)) {
 			ret = error(invalid_line, sb.buf);
 			goto finish;
 		}
@@ -576,14 +567,14 @@ static int copy_notes_for_rebase(const struct am_state *state)
 			goto finish;
 		}
 
-		if (get_sha1_hex(sb.buf + GIT_SHA1_HEXSZ + 1, to_obj)) {
+		if (get_oid_hex(sb.buf + GIT_SHA1_HEXSZ + 1, &to_obj)) {
 			ret = error(invalid_line, sb.buf);
 			goto finish;
 		}
 
-		if (copy_note_for_rewrite(c, from_obj, to_obj))
+		if (copy_note_for_rewrite(c, &from_obj, &to_obj))
 			ret = error(_("Failed to copy notes from '%s' to '%s'"),
-					sha1_to_hex(from_obj), sha1_to_hex(to_obj));
+					oid_to_hex(&from_obj), oid_to_hex(&to_obj));
 	}
 
 finish:
@@ -680,9 +671,7 @@ static int detect_patch_format(const char **paths)
 		goto done;
 	}
 
-	strbuf_reset(&l2);
 	strbuf_getline(&l2, fp);
-	strbuf_reset(&l3);
 	strbuf_getline(&l3, fp);
 
 	/*
@@ -705,6 +694,8 @@ static int detect_patch_format(const char **paths)
 done:
 	fclose(fp);
 	strbuf_release(&l1);
+	strbuf_release(&l2);
+	strbuf_release(&l3);
 	return ret;
 }
 
@@ -712,7 +703,8 @@ done:
  * Splits out individual email patches from `paths`, where each path is either
  * a mbox file or a Maildir. Returns 0 on success, -1 on failure.
  */
-static int split_mail_mbox(struct am_state *state, const char **paths, int keep_cr)
+static int split_mail_mbox(struct am_state *state, const char **paths,
+				int keep_cr, int mboxrd)
 {
 	struct child_process cp = CHILD_PROCESS_INIT;
 	struct strbuf last = STRBUF_INIT;
@@ -724,6 +716,8 @@ static int split_mail_mbox(struct am_state *state, const char **paths, int keep_
 	argv_array_push(&cp.args, "-b");
 	if (keep_cr)
 		argv_array_push(&cp.args, "--keep-cr");
+	if (mboxrd)
+		argv_array_push(&cp.args, "--mboxrd");
 	argv_array_push(&cp.args, "--");
 	argv_array_pushv(&cp.args, paths);
 
@@ -775,14 +769,18 @@ static int split_mail_conv(mail_conv_fn fn, struct am_state *state,
 		mail = mkpath("%s/%0*d", state->dir, state->prec, i + 1);
 
 		out = fopen(mail, "w");
-		if (!out)
+		if (!out) {
+			if (in != stdin)
+				fclose(in);
 			return error_errno(_("could not open '%s' for writing"),
 					   mail);
+		}
 
 		ret = fn(out, in, keep_cr);
 
 		fclose(out);
-		fclose(in);
+		if (in != stdin)
+			fclose(in);
 
 		if (ret)
 			return error(_("could not parse patch '%s'"), *paths);
@@ -883,6 +881,7 @@ static int split_mail_stgit_series(struct am_state *state, const char **paths,
 static int hg_patch_to_mail(FILE *out, FILE *in, int keep_cr)
 {
 	struct strbuf sb = STRBUF_INIT;
+	int rc = 0;
 
 	while (!strbuf_getline_lf(&sb, in)) {
 		const char *str;
@@ -890,25 +889,33 @@ static int hg_patch_to_mail(FILE *out, FILE *in, int keep_cr)
 		if (skip_prefix(sb.buf, "# User ", &str))
 			fprintf(out, "From: %s\n", str);
 		else if (skip_prefix(sb.buf, "# Date ", &str)) {
-			unsigned long timestamp;
+			timestamp_t timestamp;
 			long tz, tz2;
 			char *end;
 
 			errno = 0;
-			timestamp = strtoul(str, &end, 10);
-			if (errno)
-				return error(_("invalid timestamp"));
+			timestamp = parse_timestamp(str, &end, 10);
+			if (errno) {
+				rc = error(_("invalid timestamp"));
+				goto exit;
+			}
 
-			if (!skip_prefix(end, " ", &str))
-				return error(_("invalid Date line"));
+			if (!skip_prefix(end, " ", &str)) {
+				rc = error(_("invalid Date line"));
+				goto exit;
+			}
 
 			errno = 0;
 			tz = strtol(str, &end, 10);
-			if (errno)
-				return error(_("invalid timezone offset"));
+			if (errno) {
+				rc = error(_("invalid timezone offset"));
+				goto exit;
+			}
 
-			if (*end)
-				return error(_("invalid Date line"));
+			if (*end) {
+				rc = error(_("invalid Date line"));
+				goto exit;
+			}
 
 			/*
 			 * mercurial's timezone is in seconds west of UTC,
@@ -933,9 +940,9 @@ static int hg_patch_to_mail(FILE *out, FILE *in, int keep_cr)
 		fwrite(sb.buf, 1, sb.len, out);
 		strbuf_reset(&sb);
 	}
-
+exit:
 	strbuf_release(&sb);
-	return 0;
+	return rc;
 }
 
 /**
@@ -965,13 +972,15 @@ static int split_mail(struct am_state *state, enum patch_format patch_format,
 
 	switch (patch_format) {
 	case PATCH_FORMAT_MBOX:
-		return split_mail_mbox(state, paths, keep_cr);
+		return split_mail_mbox(state, paths, keep_cr, 0);
 	case PATCH_FORMAT_STGIT:
 		return split_mail_conv(stgit_patch_to_mail, state, paths, keep_cr);
 	case PATCH_FORMAT_STGIT_SERIES:
 		return split_mail_stgit_series(state, paths, keep_cr);
 	case PATCH_FORMAT_HG:
 		return split_mail_conv(hg_patch_to_mail, state, paths, keep_cr);
+	case PATCH_FORMAT_MBOXRD:
+		return split_mail_mbox(state, paths, keep_cr, 1);
 	default:
 		die("BUG: invalid patch_format");
 	}
@@ -984,7 +993,7 @@ static int split_mail(struct am_state *state, enum patch_format patch_format,
 static void am_setup(struct am_state *state, enum patch_format patch_format,
 			const char **paths, int keep_cr)
 {
-	unsigned char curr_head[GIT_SHA1_RAWSZ];
+	struct object_id curr_head;
 	const char *str;
 	struct strbuf sb = STRBUF_INIT;
 
@@ -1011,6 +1020,10 @@ static void am_setup(struct am_state *state, enum patch_format patch_format,
 	write_state_bool(state, "quiet", state->quiet);
 	write_state_bool(state, "sign", state->signoff);
 	write_state_bool(state, "utf8", state->utf8);
+
+	if (state->allow_rerere_autoupdate)
+		write_state_bool(state, "rerere-autoupdate",
+			 state->allow_rerere_autoupdate == RERERE_AUTOUPDATE);
 
 	switch (state->keep) {
 	case KEEP_FALSE:
@@ -1052,15 +1065,15 @@ static void am_setup(struct am_state *state, enum patch_format patch_format,
 	else
 		write_state_text(state, "applying", "");
 
-	if (!get_sha1("HEAD", curr_head)) {
-		write_state_text(state, "abort-safety", sha1_to_hex(curr_head));
+	if (!get_oid("HEAD", &curr_head)) {
+		write_state_text(state, "abort-safety", oid_to_hex(&curr_head));
 		if (!state->rebasing)
-			update_ref("am", "ORIG_HEAD", curr_head, NULL, 0,
-					UPDATE_REFS_DIE_ON_ERR);
+			update_ref("am", "ORIG_HEAD", &curr_head, NULL, 0,
+				   UPDATE_REFS_DIE_ON_ERR);
 	} else {
 		write_state_text(state, "abort-safety", "");
 		if (!state->rebasing)
-			delete_ref("ORIG_HEAD", NULL, 0);
+			delete_ref(NULL, "ORIG_HEAD", NULL, 0);
 	}
 
 	/*
@@ -1080,29 +1093,22 @@ static void am_setup(struct am_state *state, enum patch_format patch_format,
  */
 static void am_next(struct am_state *state)
 {
-	unsigned char head[GIT_SHA1_RAWSZ];
+	struct object_id head;
 
-	free(state->author_name);
-	state->author_name = NULL;
-
-	free(state->author_email);
-	state->author_email = NULL;
-
-	free(state->author_date);
-	state->author_date = NULL;
-
-	free(state->msg);
-	state->msg = NULL;
+	FREE_AND_NULL(state->author_name);
+	FREE_AND_NULL(state->author_email);
+	FREE_AND_NULL(state->author_date);
+	FREE_AND_NULL(state->msg);
 	state->msg_len = 0;
 
 	unlink(am_path(state, "author-script"));
 	unlink(am_path(state, "final-commit"));
 
-	hashclr(state->orig_commit);
+	oidclr(&state->orig_commit);
 	unlink(am_path(state, "original-commit"));
 
-	if (!get_sha1("HEAD", head))
-		write_state_text(state, "abort-safety", sha1_to_hex(head));
+	if (!get_oid("HEAD", &head))
+		write_state_text(state, "abort-safety", oid_to_hex(&head));
 	else
 		write_state_text(state, "abort-safety", "");
 
@@ -1128,11 +1134,11 @@ static const char *msgnum(const struct am_state *state)
  */
 static void refresh_and_write_cache(void)
 {
-	struct lock_file *lock_file = xcalloc(1, sizeof(struct lock_file));
+	struct lock_file lock_file = LOCK_INIT;
 
-	hold_locked_index(lock_file, 1);
+	hold_locked_index(&lock_file, LOCK_DIE_ON_ERROR);
 	refresh_cache(REFRESH_QUIET);
-	if (write_locked_index(&the_index, lock_file, COMMIT_LOCK))
+	if (write_locked_index(&the_index, &lock_file, COMMIT_LOCK))
 		die(_("unable to write index file"));
 }
 
@@ -1144,17 +1150,17 @@ static void refresh_and_write_cache(void)
  */
 static int index_has_changes(struct strbuf *sb)
 {
-	unsigned char head[GIT_SHA1_RAWSZ];
+	struct object_id head;
 	int i;
 
-	if (!get_sha1_tree("HEAD", head)) {
+	if (!get_oid_tree("HEAD", &head)) {
 		struct diff_options opt;
 
 		diff_setup(&opt);
 		DIFF_OPT_SET(&opt, EXIT_WITH_STATUS);
 		if (!sb)
 			DIFF_OPT_SET(&opt, QUICK);
-		do_diff_cache(head, &opt);
+		do_diff_cache(&head, &opt);
 		diffcore_std(&opt);
 		for (i = 0; sb && i < diff_queued_diff.nr; i++) {
 			if (i)
@@ -1192,33 +1198,6 @@ static void NORETURN die_user_resolve(const struct am_state *state)
 	exit(128);
 }
 
-static void am_signoff(struct strbuf *sb)
-{
-	char *cp;
-	struct strbuf mine = STRBUF_INIT;
-
-	/* Does it end with our own sign-off? */
-	strbuf_addf(&mine, "\n%s%s\n",
-		    sign_off_header,
-		    fmt_name(getenv("GIT_COMMITTER_NAME"),
-			     getenv("GIT_COMMITTER_EMAIL")));
-	if (mine.len < sb->len &&
-	    !strcmp(mine.buf, sb->buf + sb->len - mine.len))
-		goto exit; /* no need to duplicate */
-
-	/* Does it have any Signed-off-by: in the text */
-	for (cp = sb->buf;
-	     cp && *cp && (cp = strstr(cp, sign_off_header)) != NULL;
-	     cp = strchr(cp, '\n')) {
-		if (sb->buf == cp || cp[-1] == '\n')
-			break;
-	}
-
-	strbuf_addstr(sb, mine.buf + !!cp);
-exit:
-	strbuf_release(&mine);
-}
-
 /**
  * Appends signoff to the "msg" field of the am_state.
  */
@@ -1227,7 +1206,7 @@ static void am_append_signoff(struct am_state *state)
 	struct strbuf sb = STRBUF_INIT;
 
 	strbuf_attach(&sb, state->msg, state->msg_len, state->msg_len);
-	am_signoff(&sb);
+	append_signoff(&sb, 0, 0);
 	state->msg = strbuf_detach(&sb, &state->msg_len);
 }
 
@@ -1287,12 +1266,8 @@ static int parse_mail(struct am_state *state, const char *mail)
 		die("BUG: invalid value for state->scissors");
 	}
 
-	mi.input = fopen(mail, "r");
-	if (!mi.input)
-		die("could not open input");
-	mi.output = fopen(am_path(state, "info"), "w");
-	if (!mi.output)
-		die("could not open output 'info'");
+	mi.input = xfopen(mail, "r");
+	mi.output = xfopen(am_path(state, "info"), "w");
 	if (mailinfo(&mi, am_path(state, "msg"), am_path(state, "patch")))
 		die("could not parse patch");
 
@@ -1324,16 +1299,13 @@ static int parse_mail(struct am_state *state, const char *mail)
 	}
 
 	if (is_empty_file(am_path(state, "patch"))) {
-		printf_ln(_("Patch is empty. Was it split wrong?"));
+		printf_ln(_("Patch is empty."));
 		die_user_resolve(state);
 	}
 
 	strbuf_addstr(&msg, "\n\n");
 	strbuf_addbuf(&msg, &mi.log_message);
 	strbuf_stripspace(&msg, 0);
-
-	if (state->signoff)
-		am_signoff(&msg);
 
 	assert(!state->author_name);
 	state->author_name = strbuf_detach(&author_name, NULL);
@@ -1361,24 +1333,21 @@ finish:
  * Sets commit_id to the commit hash where the mail was generated from.
  * Returns 0 on success, -1 on failure.
  */
-static int get_mail_commit_sha1(unsigned char *commit_id, const char *mail)
+static int get_mail_commit_oid(struct object_id *commit_id, const char *mail)
 {
 	struct strbuf sb = STRBUF_INIT;
 	FILE *fp = xfopen(mail, "r");
 	const char *x;
+	int ret = 0;
 
-	if (strbuf_getline_lf(&sb, fp))
-		return -1;
-
-	if (!skip_prefix(sb.buf, "From ", &x))
-		return -1;
-
-	if (get_sha1_hex(x, commit_id) < 0)
-		return -1;
+	if (strbuf_getline_lf(&sb, fp) ||
+	    !skip_prefix(sb.buf, "From ", &x) ||
+	    get_oid_hex(x, commit_id) < 0)
+		ret = -1;
 
 	strbuf_release(&sb);
 	fclose(fp);
-	return 0;
+	return ret;
 }
 
 /**
@@ -1387,40 +1356,33 @@ static int get_mail_commit_sha1(unsigned char *commit_id, const char *mail)
  */
 static void get_commit_info(struct am_state *state, struct commit *commit)
 {
-	const char *buffer, *ident_line, *author_date, *msg;
+	const char *buffer, *ident_line, *msg;
 	size_t ident_len;
-	struct ident_split ident_split;
-	struct strbuf sb = STRBUF_INIT;
+	struct ident_split id;
 
 	buffer = logmsg_reencode(commit, NULL, get_commit_output_encoding());
 
 	ident_line = find_commit_header(buffer, "author", &ident_len);
 
-	if (split_ident_line(&ident_split, ident_line, ident_len) < 0) {
-		strbuf_add(&sb, ident_line, ident_len);
-		die(_("invalid ident line: %s"), sb.buf);
-	}
+	if (split_ident_line(&id, ident_line, ident_len) < 0)
+		die(_("invalid ident line: %.*s"), (int)ident_len, ident_line);
 
 	assert(!state->author_name);
-	if (ident_split.name_begin) {
-		strbuf_add(&sb, ident_split.name_begin,
-			ident_split.name_end - ident_split.name_begin);
-		state->author_name = strbuf_detach(&sb, NULL);
-	} else
+	if (id.name_begin)
+		state->author_name =
+			xmemdupz(id.name_begin, id.name_end - id.name_begin);
+	else
 		state->author_name = xstrdup("");
 
 	assert(!state->author_email);
-	if (ident_split.mail_begin) {
-		strbuf_add(&sb, ident_split.mail_begin,
-			ident_split.mail_end - ident_split.mail_begin);
-		state->author_email = strbuf_detach(&sb, NULL);
-	} else
+	if (id.mail_begin)
+		state->author_email =
+			xmemdupz(id.mail_begin, id.mail_end - id.mail_begin);
+	else
 		state->author_email = xstrdup("");
 
-	author_date = show_ident_date(&ident_split, DATE_MODE(NORMAL));
-	strbuf_addstr(&sb, author_date);
 	assert(!state->author_date);
-	state->author_date = strbuf_detach(&sb, NULL);
+	state->author_date = xstrdup(show_ident_date(&id, DATE_MODE(NORMAL)));
 
 	assert(!state->msg);
 	msg = strstr(buffer, "\n\n");
@@ -1428,6 +1390,7 @@ static void get_commit_info(struct am_state *state, struct commit *commit)
 		die(_("unable to parse commit %s"), oid_to_hex(&commit->object.oid));
 	state->msg = xstrdup(msg + 2);
 	state->msg_len = strlen(state->msg);
+	unuse_commit_buffer(commit, buffer);
 }
 
 /**
@@ -1463,14 +1426,14 @@ static void write_commit_patch(const struct am_state *state, struct commit *comm
 static void write_index_patch(const struct am_state *state)
 {
 	struct tree *tree;
-	unsigned char head[GIT_SHA1_RAWSZ];
+	struct object_id head;
 	struct rev_info rev_info;
 	FILE *fp;
 
-	if (!get_sha1_tree("HEAD", head))
-		tree = lookup_tree(head);
+	if (!get_oid_tree("HEAD", &head))
+		tree = lookup_tree(&head);
 	else
-		tree = lookup_tree(EMPTY_TREE_SHA1_BIN);
+		tree = lookup_tree(&empty_tree_oid);
 
 	fp = xfopen(am_path(state, "patch"), "w");
 	init_revisions(&rev_info, NULL);
@@ -1498,19 +1461,19 @@ static void write_index_patch(const struct am_state *state)
 static int parse_mail_rebase(struct am_state *state, const char *mail)
 {
 	struct commit *commit;
-	unsigned char commit_sha1[GIT_SHA1_RAWSZ];
+	struct object_id commit_oid;
 
-	if (get_mail_commit_sha1(commit_sha1, mail) < 0)
+	if (get_mail_commit_oid(&commit_oid, mail) < 0)
 		die(_("could not parse %s"), mail);
 
-	commit = lookup_commit_or_die(commit_sha1, mail);
+	commit = lookup_commit_or_die(&commit_oid, mail);
 
 	get_commit_info(state, commit);
 
 	write_commit_patch(state, commit);
 
-	hashcpy(state->orig_commit, commit_sha1);
-	write_state_text(state, "original-commit", sha1_to_hex(commit_sha1));
+	oidcpy(&state->orig_commit, &commit_oid);
+	write_state_text(state, "original-commit", oid_to_hex(&commit_oid));
 
 	return 0;
 }
@@ -1521,39 +1484,58 @@ static int parse_mail_rebase(struct am_state *state, const char *mail)
  */
 static int run_apply(const struct am_state *state, const char *index_file)
 {
-	struct child_process cp = CHILD_PROCESS_INIT;
+	struct argv_array apply_paths = ARGV_ARRAY_INIT;
+	struct argv_array apply_opts = ARGV_ARRAY_INIT;
+	struct apply_state apply_state;
+	int res, opts_left;
+	int force_apply = 0;
+	int options = 0;
 
-	cp.git_cmd = 1;
+	if (init_apply_state(&apply_state, NULL))
+		die("BUG: init_apply_state() failed");
 
-	if (index_file)
-		argv_array_pushf(&cp.env_array, "GIT_INDEX_FILE=%s", index_file);
+	argv_array_push(&apply_opts, "apply");
+	argv_array_pushv(&apply_opts, state->git_apply_opts.argv);
+
+	opts_left = apply_parse_options(apply_opts.argc, apply_opts.argv,
+					&apply_state, &force_apply, &options,
+					NULL);
+
+	if (opts_left != 0)
+		die("unknown option passed through to git apply");
+
+	if (index_file) {
+		apply_state.index_file = index_file;
+		apply_state.cached = 1;
+	} else
+		apply_state.check_index = 1;
 
 	/*
 	 * If we are allowed to fall back on 3-way merge, don't give false
 	 * errors during the initial attempt.
 	 */
-	if (state->threeway && !index_file) {
-		cp.no_stdout = 1;
-		cp.no_stderr = 1;
+	if (state->threeway && !index_file)
+		apply_state.apply_verbosity = verbosity_silent;
+
+	if (check_apply_state(&apply_state, force_apply))
+		die("BUG: check_apply_state() failed");
+
+	argv_array_push(&apply_paths, am_path(state, "patch"));
+
+	res = apply_all_patches(&apply_state, apply_paths.argc, apply_paths.argv, options);
+
+	argv_array_clear(&apply_paths);
+	argv_array_clear(&apply_opts);
+	clear_apply_state(&apply_state);
+
+	if (res)
+		return res;
+
+	if (index_file) {
+		/* Reload index as apply_all_patches() will have modified it. */
+		discard_cache();
+		read_cache_from(index_file);
 	}
-
-	argv_array_push(&cp.args, "apply");
-
-	argv_array_pushv(&cp.args, state->git_apply_opts.argv);
-
-	if (index_file)
-		argv_array_push(&cp.args, "--cached");
-	else
-		argv_array_push(&cp.args, "--index");
-
-	argv_array_push(&cp.args, am_path(state, "patch"));
-
-	if (run_command(&cp))
-		return -1;
-
-	/* Reload index as git-apply will have modified it. */
-	discard_cache();
-	read_cache_from(index_file ? index_file : get_index_file());
 
 	return 0;
 }
@@ -1578,47 +1560,18 @@ static int build_fake_ancestor(const struct am_state *state, const char *index_f
 }
 
 /**
- * Do the three-way merge using fake ancestor, their tree constructed
- * from the fake ancestor and the postimage of the patch, and our
- * state.
- */
-static int run_fallback_merge_recursive(const struct am_state *state,
-					unsigned char *orig_tree,
-					unsigned char *our_tree,
-					unsigned char *their_tree)
-{
-	struct child_process cp = CHILD_PROCESS_INIT;
-	int status;
-
-	cp.git_cmd = 1;
-
-	argv_array_pushf(&cp.env_array, "GITHEAD_%s=%.*s",
-			 sha1_to_hex(their_tree), linelen(state->msg), state->msg);
-	if (state->quiet)
-		argv_array_push(&cp.env_array, "GIT_MERGE_VERBOSITY=0");
-
-	argv_array_push(&cp.args, "merge-recursive");
-	argv_array_push(&cp.args, sha1_to_hex(orig_tree));
-	argv_array_push(&cp.args, "--");
-	argv_array_push(&cp.args, sha1_to_hex(our_tree));
-	argv_array_push(&cp.args, sha1_to_hex(their_tree));
-
-	status = run_command(&cp) ? (-1) : 0;
-	discard_cache();
-	read_cache();
-	return status;
-}
-
-/**
  * Attempt a threeway merge, using index_path as the temporary index.
  */
 static int fall_back_threeway(const struct am_state *state, const char *index_path)
 {
-	unsigned char orig_tree[GIT_SHA1_RAWSZ], their_tree[GIT_SHA1_RAWSZ],
-		      our_tree[GIT_SHA1_RAWSZ];
+	struct object_id orig_tree, their_tree, our_tree;
+	const struct object_id *bases[1] = { &orig_tree };
+	struct merge_options o;
+	struct commit *result;
+	char *their_tree_name;
 
-	if (get_sha1("HEAD", our_tree) < 0)
-		hashcpy(our_tree, EMPTY_TREE_SHA1_BIN);
+	if (get_oid("HEAD", &our_tree) < 0)
+		hashcpy(our_tree.hash, EMPTY_TREE_SHA1_BIN);
 
 	if (build_fake_ancestor(state, index_path))
 		return error("could not build fake ancestor");
@@ -1626,7 +1579,7 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 	discard_cache();
 	read_cache_from(index_path);
 
-	if (write_index_as_tree(orig_tree, &the_index, index_path, 0, NULL))
+	if (write_index_as_tree(orig_tree.hash, &the_index, index_path, 0, NULL))
 		return error(_("Repository lacks necessary blobs to fall back on 3-way merge."));
 
 	say(state, stdout, _("Using index info to reconstruct a base tree..."));
@@ -1642,7 +1595,7 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 		init_revisions(&rev_info, NULL);
 		rev_info.diffopt.output_format = DIFF_FORMAT_NAME_STATUS;
 		diff_opt_parse(&rev_info.diffopt, &diff_filter_str, 1, rev_info.prefix);
-		add_pending_sha1(&rev_info, "HEAD", our_tree, 0);
+		add_pending_oid(&rev_info, "HEAD", &our_tree, 0);
 		diff_setup_done(&rev_info.diffopt);
 		run_diff_index(&rev_info, 1);
 	}
@@ -1651,7 +1604,7 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 		return error(_("Did you hand edit your patch?\n"
 				"It does not apply to blobs recorded in its index."));
 
-	if (write_index_as_tree(their_tree, &the_index, index_path, 0, NULL))
+	if (write_index_as_tree(their_tree.hash, &the_index, index_path, 0, NULL))
 		return error("could not write tree");
 
 	say(state, stdout, _("Falling back to patching base and 3-way merge..."));
@@ -1667,11 +1620,22 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
 	 * changes.
 	 */
 
-	if (run_fallback_merge_recursive(state, orig_tree, our_tree, their_tree)) {
+	init_merge_options(&o);
+
+	o.branch1 = "HEAD";
+	their_tree_name = xstrfmt("%.*s", linelen(state->msg), state->msg);
+	o.branch2 = their_tree_name;
+
+	if (state->quiet)
+		o.verbosity = 0;
+
+	if (merge_recursive_generic(&o, &our_tree, &their_tree, 1, bases, &result)) {
 		rerere(state->allow_rerere_autoupdate);
+		free(their_tree_name);
 		return error(_("Failed to merge in the changes."));
 	}
 
+	free(their_tree_name);
 	return 0;
 }
 
@@ -1682,9 +1646,8 @@ static int fall_back_threeway(const struct am_state *state, const char *index_pa
  */
 static void do_commit(const struct am_state *state)
 {
-	unsigned char tree[GIT_SHA1_RAWSZ], parent[GIT_SHA1_RAWSZ],
-		      commit[GIT_SHA1_RAWSZ];
-	unsigned char *ptr;
+	struct object_id tree, parent, commit;
+	const struct object_id *old_oid;
 	struct commit_list *parents = NULL;
 	const char *reflog_msg, *author;
 	struct strbuf sb = STRBUF_INIT;
@@ -1692,14 +1655,14 @@ static void do_commit(const struct am_state *state)
 	if (run_hook_le(NULL, "pre-applypatch", NULL))
 		exit(1);
 
-	if (write_cache_as_tree(tree, 0, NULL))
+	if (write_cache_as_tree(tree.hash, 0, NULL))
 		die(_("git write-tree failed to write a tree"));
 
-	if (!get_sha1_commit("HEAD", parent)) {
-		ptr = parent;
-		commit_list_insert(lookup_commit(parent), &parents);
+	if (!get_oid_commit("HEAD", &parent)) {
+		old_oid = &parent;
+		commit_list_insert(lookup_commit(&parent), &parents);
 	} else {
-		ptr = NULL;
+		old_oid = NULL;
 		say(state, stderr, _("applying to an empty history"));
 	}
 
@@ -1711,7 +1674,7 @@ static void do_commit(const struct am_state *state)
 		setenv("GIT_COMMITTER_DATE",
 			state->ignore_date ? "" : state->author_date, 1);
 
-	if (commit_tree(state->msg, state->msg_len, tree, parents, commit,
+	if (commit_tree(state->msg, state->msg_len, tree.hash, parents, commit.hash,
 				author, state->sign_commit))
 		die(_("failed to write commit object"));
 
@@ -1722,14 +1685,15 @@ static void do_commit(const struct am_state *state)
 	strbuf_addf(&sb, "%s: %.*s", reflog_msg, linelen(state->msg),
 			state->msg);
 
-	update_ref(sb.buf, "HEAD", commit, ptr, 0, UPDATE_REFS_DIE_ON_ERR);
+	update_ref(sb.buf, "HEAD", &commit, old_oid, 0,
+		   UPDATE_REFS_DIE_ON_ERR);
 
 	if (state->rebasing) {
 		FILE *fp = xfopen(am_path(state, "rewritten"), "a");
 
-		assert(!is_null_sha1(state->orig_commit));
-		fprintf(fp, "%s ", sha1_to_hex(state->orig_commit));
-		fprintf(fp, "%s\n", sha1_to_hex(commit));
+		assert(!is_null_oid(&state->orig_commit));
+		fprintf(fp, "%s ", oid_to_hex(&state->orig_commit));
+		fprintf(fp, "%s\n", oid_to_hex(&commit));
 		fclose(fp);
 	}
 
@@ -1857,6 +1821,9 @@ static void am_run(struct am_state *state, int resume)
 			if (skip)
 				goto next; /* mail should be skipped */
 
+			if (state->signoff)
+				am_append_signoff(state);
+
 			write_author_script(state);
 			write_commit_msg(state);
 		}
@@ -1950,7 +1917,8 @@ static void am_resolve(struct am_state *state)
 
 	if (unmerged_cache()) {
 		printf_ln(_("You still have unmerged paths in your index.\n"
-			"Did you forget to use 'git add'?"));
+			"You should 'git add' each file with resolved conflicts to mark them as such.\n"
+			"You might run `git rm` on a file to accept \"deleted by them\" for it."));
 		die_user_resolve(state);
 	}
 
@@ -1977,15 +1945,14 @@ next:
  */
 static int fast_forward_to(struct tree *head, struct tree *remote, int reset)
 {
-	struct lock_file *lock_file;
+	struct lock_file lock_file = LOCK_INIT;
 	struct unpack_trees_options opts;
 	struct tree_desc t[2];
 
 	if (parse_tree(head) || parse_tree(remote))
 		return -1;
 
-	lock_file = xcalloc(1, sizeof(struct lock_file));
-	hold_locked_index(lock_file, 1);
+	hold_locked_index(&lock_file, LOCK_DIE_ON_ERROR);
 
 	refresh_cache(REFRESH_QUIET);
 
@@ -2001,11 +1968,11 @@ static int fast_forward_to(struct tree *head, struct tree *remote, int reset)
 	init_tree_desc(&t[1], remote->buffer, remote->size);
 
 	if (unpack_trees(2, t, &opts)) {
-		rollback_lock_file(lock_file);
+		rollback_lock_file(&lock_file);
 		return -1;
 	}
 
-	if (write_locked_index(&the_index, lock_file, COMMIT_LOCK))
+	if (write_locked_index(&the_index, &lock_file, COMMIT_LOCK))
 		die(_("unable to write new index file"));
 
 	return 0;
@@ -2017,15 +1984,14 @@ static int fast_forward_to(struct tree *head, struct tree *remote, int reset)
  */
 static int merge_tree(struct tree *tree)
 {
-	struct lock_file *lock_file;
+	struct lock_file lock_file = LOCK_INIT;
 	struct unpack_trees_options opts;
 	struct tree_desc t[1];
 
 	if (parse_tree(tree))
 		return -1;
 
-	lock_file = xcalloc(1, sizeof(struct lock_file));
-	hold_locked_index(lock_file, 1);
+	hold_locked_index(&lock_file, LOCK_DIE_ON_ERROR);
 
 	memset(&opts, 0, sizeof(opts));
 	opts.head_idx = 1;
@@ -2036,11 +2002,11 @@ static int merge_tree(struct tree *tree)
 	init_tree_desc(&t[0], tree->buffer, tree->size);
 
 	if (unpack_trees(1, t, &opts)) {
-		rollback_lock_file(lock_file);
+		rollback_lock_file(&lock_file);
 		return -1;
 	}
 
-	if (write_locked_index(&the_index, lock_file, COMMIT_LOCK))
+	if (write_locked_index(&the_index, &lock_file, COMMIT_LOCK))
 		die(_("unable to write new index file"));
 
 	return 0;
@@ -2050,30 +2016,30 @@ static int merge_tree(struct tree *tree)
  * Clean the index without touching entries that are not modified between
  * `head` and `remote`.
  */
-static int clean_index(const unsigned char *head, const unsigned char *remote)
+static int clean_index(const struct object_id *head, const struct object_id *remote)
 {
 	struct tree *head_tree, *remote_tree, *index_tree;
-	unsigned char index[GIT_SHA1_RAWSZ];
+	struct object_id index;
 
 	head_tree = parse_tree_indirect(head);
 	if (!head_tree)
-		return error(_("Could not parse object '%s'."), sha1_to_hex(head));
+		return error(_("Could not parse object '%s'."), oid_to_hex(head));
 
 	remote_tree = parse_tree_indirect(remote);
 	if (!remote_tree)
-		return error(_("Could not parse object '%s'."), sha1_to_hex(remote));
+		return error(_("Could not parse object '%s'."), oid_to_hex(remote));
 
 	read_cache_unmerged();
 
 	if (fast_forward_to(head_tree, head_tree, 1))
 		return -1;
 
-	if (write_cache_as_tree(index, 0, NULL))
+	if (write_cache_as_tree(index.hash, 0, NULL))
 		return -1;
 
-	index_tree = parse_tree_indirect(index);
+	index_tree = parse_tree_indirect(&index);
 	if (!index_tree)
-		return error(_("Could not parse object '%s'."), sha1_to_hex(index));
+		return error(_("Could not parse object '%s'."), oid_to_hex(&index));
 
 	if (fast_forward_to(index_tree, remote_tree, 0))
 		return -1;
@@ -2101,14 +2067,14 @@ static void am_rerere_clear(void)
  */
 static void am_skip(struct am_state *state)
 {
-	unsigned char head[GIT_SHA1_RAWSZ];
+	struct object_id head;
 
 	am_rerere_clear();
 
-	if (get_sha1("HEAD", head))
-		hashcpy(head, EMPTY_TREE_SHA1_BIN);
+	if (get_oid("HEAD", &head))
+		hashcpy(head.hash, EMPTY_TREE_SHA1_BIN);
 
-	if (clean_index(head, head))
+	if (clean_index(&head, &head))
 		die(_("failed to clean index"));
 
 	am_next(state);
@@ -2126,24 +2092,25 @@ static void am_skip(struct am_state *state)
 static int safe_to_abort(const struct am_state *state)
 {
 	struct strbuf sb = STRBUF_INIT;
-	unsigned char abort_safety[GIT_SHA1_RAWSZ], head[GIT_SHA1_RAWSZ];
+	struct object_id abort_safety, head;
 
 	if (file_exists(am_path(state, "dirtyindex")))
 		return 0;
 
 	if (read_state_file(&sb, state, "abort-safety", 1) > 0) {
-		if (get_sha1_hex(sb.buf, abort_safety))
-			die(_("could not parse %s"), am_path(state, "abort_safety"));
+		if (get_oid_hex(sb.buf, &abort_safety))
+			die(_("could not parse %s"), am_path(state, "abort-safety"));
 	} else
-		hashclr(abort_safety);
+		oidclr(&abort_safety);
+	strbuf_release(&sb);
 
-	if (get_sha1("HEAD", head))
-		hashclr(head);
+	if (get_oid("HEAD", &head))
+		oidclr(&head);
 
-	if (!hashcmp(head, abort_safety))
+	if (!oidcmp(&head, &abort_safety))
 		return 1;
 
-	error(_("You seem to have moved HEAD since the last 'am' failure.\n"
+	warning(_("You seem to have moved HEAD since the last 'am' failure.\n"
 		"Not rewinding to ORIG_HEAD"));
 
 	return 0;
@@ -2154,7 +2121,7 @@ static int safe_to_abort(const struct am_state *state)
  */
 static void am_abort(struct am_state *state)
 {
-	unsigned char curr_head[GIT_SHA1_RAWSZ], orig_head[GIT_SHA1_RAWSZ];
+	struct object_id curr_head, orig_head;
 	int has_curr_head, has_orig_head;
 	char *curr_branch;
 
@@ -2165,23 +2132,23 @@ static void am_abort(struct am_state *state)
 
 	am_rerere_clear();
 
-	curr_branch = resolve_refdup("HEAD", 0, curr_head, NULL);
-	has_curr_head = !is_null_sha1(curr_head);
+	curr_branch = resolve_refdup("HEAD", 0, &curr_head, NULL);
+	has_curr_head = curr_branch && !is_null_oid(&curr_head);
 	if (!has_curr_head)
-		hashcpy(curr_head, EMPTY_TREE_SHA1_BIN);
+		hashcpy(curr_head.hash, EMPTY_TREE_SHA1_BIN);
 
-	has_orig_head = !get_sha1("ORIG_HEAD", orig_head);
+	has_orig_head = !get_oid("ORIG_HEAD", &orig_head);
 	if (!has_orig_head)
-		hashcpy(orig_head, EMPTY_TREE_SHA1_BIN);
+		hashcpy(orig_head.hash, EMPTY_TREE_SHA1_BIN);
 
-	clean_index(curr_head, orig_head);
+	clean_index(&curr_head, &orig_head);
 
 	if (has_orig_head)
-		update_ref("am --abort", "HEAD", orig_head,
-				has_curr_head ? curr_head : NULL, 0,
-				UPDATE_REFS_DIE_ON_ERR);
+		update_ref("am --abort", "HEAD", &orig_head,
+			   has_curr_head ? &curr_head : NULL, 0,
+			   UPDATE_REFS_DIE_ON_ERR);
 	else if (curr_branch)
-		delete_ref(curr_branch, NULL, REF_NODEREF);
+		delete_ref(NULL, curr_branch, NULL, REF_NODEREF);
 
 	free(curr_branch);
 	am_destroy(state);
@@ -2203,6 +2170,8 @@ static int parse_opt_patchformat(const struct option *opt, const char *arg, int 
 		*opt_value = PATCH_FORMAT_STGIT_SERIES;
 	else if (!strcmp(arg, "hg"))
 		*opt_value = PATCH_FORMAT_HG;
+	else if (!strcmp(arg, "mboxrd"))
+		*opt_value = PATCH_FORMAT_MBOXRD;
 	else
 		return error(_("Invalid value for --patch-format: %s"), arg);
 	return 0;
@@ -2237,7 +2206,7 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 	int in_progress;
 
 	const char * const usage[] = {
-		N_("git am [<options>] [(<mbox>|<Maildir>)...]"),
+		N_("git am [<options>] [(<mbox> | <Maildir>)...]"),
 		N_("git am [<options>] (--continue | --skip | --abort)"),
 		NULL
 	};
@@ -2327,9 +2296,12 @@ int cmd_am(int argc, const char **argv, const char *prefix)
 		OPT_END()
 	};
 
+	if (argc == 2 && !strcmp(argv[1], "-h"))
+		usage_with_options(usage, options);
+
 	git_config(git_am_config, NULL);
 
-	am_state_init(&state, git_path("rebase-apply"));
+	am_state_init(&state);
 
 	in_progress = am_in_progress(&state);
 	if (in_progress)

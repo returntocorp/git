@@ -14,7 +14,7 @@ struct diff_queue_struct;
 struct strbuf;
 struct diff_filespec;
 struct userdiff_driver;
-struct sha1_array;
+struct oid_array;
 struct commit;
 struct combine_diff_path;
 
@@ -23,16 +23,16 @@ typedef int (*pathchange_fn_t)(struct diff_options *options,
 
 typedef void (*change_fn_t)(struct diff_options *options,
 		 unsigned old_mode, unsigned new_mode,
-		 const unsigned char *old_sha1,
-		 const unsigned char *new_sha1,
-		 int old_sha1_valid, int new_sha1_valid,
+		 const struct object_id *old_oid,
+		 const struct object_id *new_oid,
+		 int old_oid_valid, int new_oid_valid,
 		 const char *fullpath,
 		 unsigned old_dirty_submodule, unsigned new_dirty_submodule);
 
 typedef void (*add_remove_fn_t)(struct diff_options *options,
 		    int addremove, unsigned mode,
-		    const unsigned char *sha1,
-		    int sha1_valid,
+		    const struct object_id *oid,
+		    int oid_valid,
 		    const char *fullpath, unsigned dirty_submodule);
 
 typedef void (*diff_format_fn_t)(struct diff_queue_struct *q,
@@ -83,7 +83,6 @@ typedef struct strbuf *(*diff_prefix_fn_t)(struct diff_options *opt, void *data)
 #define DIFF_OPT_DIRSTAT_BY_FILE     (1 << 20)
 #define DIFF_OPT_ALLOW_TEXTCONV      (1 << 21)
 #define DIFF_OPT_DIFF_FROM_CONTENTS  (1 << 22)
-#define DIFF_OPT_SUBMODULE_LOG       (1 << 23)
 #define DIFF_OPT_DIRTY_SUBMODULES    (1 << 24)
 #define DIFF_OPT_IGNORE_UNTRACKED_IN_SUBMODULES (1 << 25)
 #define DIFF_OPT_IGNORE_DIRTY_SUBMODULES (1 << 26)
@@ -110,11 +109,19 @@ enum diff_words_type {
 	DIFF_WORDS_COLOR
 };
 
+enum diff_submodule_format {
+	DIFF_SUBMODULE_SHORT = 0,
+	DIFF_SUBMODULE_LOG,
+	DIFF_SUBMODULE_INLINE_DIFF
+};
+
 struct diff_options {
 	const char *orderfile;
 	const char *pickaxe;
 	const char *single_follow;
 	const char *a_prefix, *b_prefix;
+	const char *line_prefix;
+	size_t line_prefix_length;
 	unsigned flags;
 	unsigned touched_flags;
 
@@ -139,10 +146,11 @@ struct diff_options {
 	int dirstat_permille;
 	int setup;
 	int abbrev;
+	int ita_invisible_in_index;
 /* white-space error highlighting */
-#define WSEH_NEW 1
-#define WSEH_CONTEXT 2
-#define WSEH_OLD 4
+#define WSEH_NEW (1<<12)
+#define WSEH_CONTEXT (1<<13)
+#define WSEH_OLD (1<<14)
 	unsigned ws_error_highlight;
 	const char *prefix;
 	int prefix_length;
@@ -155,6 +163,7 @@ struct diff_options {
 	int stat_count;
 	const char *word_regex;
 	enum diff_words_type word_diff;
+	enum diff_submodule_format submodule_format;
 
 	/* this is set by diffcore for DIFF_FORMAT_PATCH */
 	int found_changes;
@@ -171,14 +180,33 @@ struct diff_options {
 	pathchange_fn_t pathchange;
 	change_fn_t change;
 	add_remove_fn_t add_remove;
+	void *change_fn_data;
 	diff_format_fn_t format_callback;
 	void *format_callback_data;
 	diff_prefix_fn_t output_prefix;
-	int output_prefix_length;
 	void *output_prefix_data;
 
 	int diff_path_counter;
+
+	struct emitted_diff_symbols *emitted_symbols;
+	enum {
+		COLOR_MOVED_NO = 0,
+		COLOR_MOVED_PLAIN = 1,
+		COLOR_MOVED_ZEBRA = 2,
+		COLOR_MOVED_ZEBRA_DIM = 3,
+	} color_moved;
+	#define COLOR_MOVED_DEFAULT COLOR_MOVED_ZEBRA
+	#define COLOR_MOVED_MIN_ALNUM_COUNT 20
 };
+
+void diff_emit_submodule_del(struct diff_options *o, const char *line);
+void diff_emit_submodule_add(struct diff_options *o, const char *line);
+void diff_emit_submodule_untracked(struct diff_options *o, const char *path);
+void diff_emit_submodule_modified(struct diff_options *o, const char *path);
+void diff_emit_submodule_header(struct diff_options *o, const char *header);
+void diff_emit_submodule_error(struct diff_options *o, const char *err);
+void diff_emit_submodule_pipethrough(struct diff_options *o,
+				     const char *line, int len);
 
 enum color_diff {
 	DIFF_RESET = 0,
@@ -189,7 +217,15 @@ enum color_diff {
 	DIFF_FILE_NEW = 5,
 	DIFF_COMMIT = 6,
 	DIFF_WHITESPACE = 7,
-	DIFF_FUNCINFO = 8
+	DIFF_FUNCINFO = 8,
+	DIFF_FILE_OLD_MOVED = 9,
+	DIFF_FILE_OLD_MOVED_ALT = 10,
+	DIFF_FILE_OLD_MOVED_DIM = 11,
+	DIFF_FILE_OLD_MOVED_ALT_DIM = 12,
+	DIFF_FILE_NEW_MOVED = 13,
+	DIFF_FILE_NEW_MOVED_ALT = 14,
+	DIFF_FILE_NEW_MOVED_DIM = 15,
+	DIFF_FILE_NEW_MOVED_ALT_DIM = 16
 };
 const char *diff_get_color(int diff_use_color, enum color_diff ix);
 #define diff_get_color_opt(o, ix) \
@@ -202,13 +238,14 @@ const char *diff_line_prefix(struct diff_options *);
 extern const char mime_boundary_leader[];
 
 extern struct combine_diff_path *diff_tree_paths(
-	struct combine_diff_path *p, const unsigned char *sha1,
-	const unsigned char **parent_sha1, int nparent,
+	struct combine_diff_path *p, const struct object_id *oid,
+	const struct object_id **parents_oid, int nparent,
 	struct strbuf *base, struct diff_options *opt);
-extern int diff_tree_sha1(const unsigned char *old, const unsigned char *new,
-			  const char *base, struct diff_options *opt);
-extern int diff_root_tree_sha1(const unsigned char *new, const char *base,
-                               struct diff_options *opt);
+extern int diff_tree_oid(const struct object_id *old_oid,
+			 const struct object_id *new_oid,
+			 const char *base, struct diff_options *opt);
+extern int diff_root_tree_oid(const struct object_id *new_oid, const char *base,
+			      struct diff_options *opt);
 
 struct combine_diff_path {
 	struct combine_diff_path *next;
@@ -228,7 +265,7 @@ struct combine_diff_path {
 extern void show_combined_diff(struct combine_diff_path *elem, int num_parent,
 			      int dense, struct rev_info *);
 
-extern void diff_tree_combined(const unsigned char *sha1, const struct sha1_array *parents, int dense, struct rev_info *rev);
+extern void diff_tree_combined(const struct object_id *oid, const struct oid_array *parents, int dense, struct rev_info *rev);
 
 extern void diff_tree_combined_merge(const struct commit *commit, int dense, struct rev_info *rev);
 
@@ -239,16 +276,15 @@ extern int diff_can_quit_early(struct diff_options *);
 extern void diff_addremove(struct diff_options *,
 			   int addremove,
 			   unsigned mode,
-			   const unsigned char *sha1,
-			   int sha1_valid,
+			   const struct object_id *oid,
+			   int oid_valid,
 			   const char *fullpath, unsigned dirty_submodule);
 
 extern void diff_change(struct diff_options *,
 			unsigned mode1, unsigned mode2,
-			const unsigned char *sha1,
-			const unsigned char *sha2,
-			int sha1_valid,
-			int sha2_valid,
+			const struct object_id *old_oid,
+			const struct object_id *new_oid,
+			int old_oid_valid, int new_oid_valid,
 			const char *fullpath,
 			unsigned dirty_submodule1, unsigned dirty_submodule2);
 
@@ -266,6 +302,7 @@ extern int parse_long_opt(const char *opt, const char **argv,
 			 const char **optarg);
 
 extern int git_diff_basic_config(const char *var, const char *value, void *cb);
+extern int git_diff_heuristic_config(const char *var, const char *value, void *cb);
 extern void init_diff_ui_defaults(void);
 extern int git_diff_ui_config(const char *var, const char *value, void *cb);
 extern void diff_setup(struct diff_options *);
@@ -332,7 +369,11 @@ extern void diff_warn_rename_limit(const char *varname, int needed, int degraded
 #define DIFF_STATUS_FILTER_AON		'*'
 #define DIFF_STATUS_FILTER_BROKEN	'B'
 
-extern const char *diff_unique_abbrev(const unsigned char *, int);
+/*
+ * This is different from find_unique_abbrev() in that
+ * it stuffs the result with dots for alignment.
+ */
+extern const char *diff_aligned_abbrev(const struct object_id *sha1, int);
 
 /* do not report anything on removed paths */
 #define DIFF_SILENT_ON_REMOVED 01
@@ -341,14 +382,14 @@ extern const char *diff_unique_abbrev(const unsigned char *, int);
 extern int run_diff_files(struct rev_info *revs, unsigned int option);
 extern int run_diff_index(struct rev_info *revs, int cached);
 
-extern int do_diff_cache(const unsigned char *, struct diff_options *);
-extern int diff_flush_patch_id(struct diff_options *, unsigned char *);
+extern int do_diff_cache(const struct object_id *, struct diff_options *);
+extern int diff_flush_patch_id(struct diff_options *, struct object_id *, int);
 
 extern int diff_result_code(struct diff_options *, int);
 
 extern void diff_no_index(struct rev_info *, int, const char **);
 
-extern int index_differs_from(const char *def, int diff_flags);
+extern int index_differs_from(const char *def, int diff_flags, int ita_invisible_in_index);
 
 /*
  * Fill the contents of the filespec "df", respecting any textconv defined by
@@ -372,12 +413,19 @@ extern size_t fill_textconv(struct userdiff_driver *driver,
  */
 extern struct userdiff_driver *get_textconv(struct diff_filespec *one);
 
+/*
+ * Prepare diff_filespec and convert it using diff textconv API
+ * if the textconv driver exists.
+ * Return 1 if the conversion succeeds, 0 otherwise.
+ */
+extern int textconv_object(const char *path, unsigned mode, const struct object_id *oid, int oid_valid, char **buf, unsigned long *buf_size);
+
 extern int parse_rename_score(const char **cp_p);
 
 extern long parse_algorithm_value(const char *value);
 
-extern int print_stat_summary(FILE *fp, int files,
-			      int insertions, int deletions);
+extern void print_stat_summary(FILE *fp, int files,
+			       int insertions, int deletions);
 extern void setup_diff_pager(struct diff_options *);
 
 #endif /* DIFF_H */

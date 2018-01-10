@@ -1,6 +1,7 @@
 #include "git-compat-util.h"
 #include "parse-options.h"
 #include "cache.h"
+#include "config.h"
 #include "commit.h"
 #include "color.h"
 #include "utf8.h"
@@ -40,7 +41,7 @@ static void fix_filename(const char *prefix, const char **file)
 	if (!file || !*file || !prefix || is_absolute_path(*file)
 	    || !strcmp("-", *file))
 		return;
-	*file = xstrdup(prefix_filename(prefix, strlen(prefix), *file));
+	*file = prefix_filename(prefix, *file);
 }
 
 static int opt_command_mode_error(const struct option *opt,
@@ -580,6 +581,7 @@ static int usage_with_options_internal(struct parse_opt_ctx_t *ctx,
 				       const struct option *opts, int full, int err)
 {
 	FILE *outfile = err ? stderr : stdout;
+	int need_newline;
 
 	if (!usagestr)
 		return PARSE_OPT_HELP;
@@ -589,19 +591,20 @@ static int usage_with_options_internal(struct parse_opt_ctx_t *ctx,
 
 	fprintf_ln(outfile, _("usage: %s"), _(*usagestr++));
 	while (*usagestr && **usagestr)
-		/* TRANSLATORS: the colon here should align with the
-		   one in "usage: %s" translation */
+		/*
+		 * TRANSLATORS: the colon here should align with the
+		 * one in "usage: %s" translation.
+		 */
 		fprintf_ln(outfile, _("   or: %s"), _(*usagestr++));
 	while (*usagestr) {
 		if (**usagestr)
 			fprintf_ln(outfile, _("    %s"), _(*usagestr));
 		else
-			putchar('\n');
+			fputc('\n', outfile);
 		usagestr++;
 	}
 
-	if (opts->type != OPTION_GROUP)
-		fputc('\n', outfile);
+	need_newline = 1;
 
 	for (; opts->type != OPTION_END; opts++) {
 		size_t pos;
@@ -609,12 +612,18 @@ static int usage_with_options_internal(struct parse_opt_ctx_t *ctx,
 
 		if (opts->type == OPTION_GROUP) {
 			fputc('\n', outfile);
+			need_newline = 0;
 			if (*opts->help)
 				fprintf(outfile, "%s\n", _(opts->help));
 			continue;
 		}
 		if (!full && (opts->flags & PARSE_OPT_HIDDEN))
 			continue;
+
+		if (need_newline) {
+			fputc('\n', outfile);
+			need_newline = 0;
+		}
 
 		pos = fprintf(outfile, "    ");
 		if (opts->short_name) {
@@ -661,7 +670,7 @@ void NORETURN usage_msg_opt(const char *msg,
 		   const char * const *usagestr,
 		   const struct option *options)
 {
-	fprintf(stderr, "%s\n\n", msg);
+	fprintf(stderr, "fatal: %s\n\n", msg);
 	usage_with_options(usagestr, options);
 }
 

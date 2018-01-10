@@ -7,6 +7,7 @@ test_description='for-each-ref test'
 
 . ./test-lib.sh
 . "$TEST_DIRECTORY"/lib-gpg.sh
+. "$TEST_DIRECTORY"/lib-terminal.sh
 
 # Mon Jul 3 23:18:43 2006 +0000
 datestamp=1151968723
@@ -38,6 +39,7 @@ test_atom() {
 	case "$1" in
 		head) ref=refs/heads/master ;;
 		 tag) ref=refs/tags/testtag ;;
+		 sym) ref=refs/heads/sym ;;
 		   *) ref=$1 ;;
 	esac
 	printf '%s\n' "$3" >expected
@@ -49,17 +51,42 @@ test_atom() {
 }
 
 test_atom head refname refs/heads/master
+test_atom head refname: refs/heads/master
 test_atom head refname:short master
+test_atom head refname:lstrip=1 heads/master
+test_atom head refname:lstrip=2 master
+test_atom head refname:lstrip=-1 master
+test_atom head refname:lstrip=-2 heads/master
+test_atom head refname:rstrip=1 refs/heads
+test_atom head refname:rstrip=2 refs
+test_atom head refname:rstrip=-1 refs
+test_atom head refname:rstrip=-2 refs/heads
 test_atom head refname:strip=1 heads/master
 test_atom head refname:strip=2 master
+test_atom head refname:strip=-1 master
+test_atom head refname:strip=-2 heads/master
 test_atom head upstream refs/remotes/origin/master
 test_atom head upstream:short origin/master
+test_atom head upstream:lstrip=2 origin/master
+test_atom head upstream:lstrip=-2 origin/master
+test_atom head upstream:rstrip=2 refs/remotes
+test_atom head upstream:rstrip=-2 refs/remotes
+test_atom head upstream:strip=2 origin/master
+test_atom head upstream:strip=-2 origin/master
 test_atom head push refs/remotes/myfork/master
 test_atom head push:short myfork/master
+test_atom head push:lstrip=1 remotes/myfork/master
+test_atom head push:lstrip=-1 master
+test_atom head push:rstrip=1 refs/remotes/myfork
+test_atom head push:rstrip=-1 refs
+test_atom head push:strip=1 remotes/myfork/master
+test_atom head push:strip=-1 master
 test_atom head objecttype commit
 test_atom head objectsize 171
 test_atom head objectname $(git rev-parse refs/heads/master)
 test_atom head objectname:short $(git rev-parse --short refs/heads/master)
+test_atom head objectname:short=1 $(git rev-parse --short=1 refs/heads/master)
+test_atom head objectname:short=10 $(git rev-parse --short=10 refs/heads/master)
 test_atom head tree $(git rev-parse refs/heads/master^{tree})
 test_atom head parent ''
 test_atom head numparent 0
@@ -99,6 +126,8 @@ test_atom tag objecttype tag
 test_atom tag objectsize 154
 test_atom tag objectname $(git rev-parse refs/tags/testtag)
 test_atom tag objectname:short $(git rev-parse --short refs/tags/testtag)
+test_atom head objectname:short=1 $(git rev-parse --short=1 refs/heads/master)
+test_atom head objectname:short=10 $(git rev-parse --short=10 refs/heads/master)
 test_atom tag tree ''
 test_atom tag parent ''
 test_atom tag numparent ''
@@ -134,16 +163,6 @@ test_expect_success 'Check invalid atoms names are errors' '
 	test_must_fail git for-each-ref --format="%(INVALID)" refs/heads
 '
 
-test_expect_success 'arguments to :strip must be positive integers' '
-	test_must_fail git for-each-ref --format="%(refname:strip=0)" &&
-	test_must_fail git for-each-ref --format="%(refname:strip=-1)" &&
-	test_must_fail git for-each-ref --format="%(refname:strip=foo)"
-'
-
-test_expect_success 'stripping refnames too far gives an error' '
-	test_must_fail git for-each-ref --format="%(refname:strip=3)"
-'
-
 test_expect_success 'Check format specifiers are ignored in naming date atoms' '
 	git for-each-ref --format="%(authordate)" refs/heads &&
 	git for-each-ref --format="%(authordate:default) %(authordate)" refs/heads &&
@@ -162,6 +181,12 @@ test_expect_success 'Check valid format specifiers for date fields' '
 
 test_expect_success 'Check invalid format specifiers are errors' '
 	test_must_fail git for-each-ref --format="%(authordate:INVALID)" refs/heads
+'
+
+test_expect_success 'arguments to %(objectname:short=) must be positive integers' '
+	test_must_fail git for-each-ref --format="%(objectname:short=0)" &&
+	test_must_fail git for-each-ref --format="%(objectname:short=-1)" &&
+	test_must_fail git for-each-ref --format="%(objectname:short=foo)"
 '
 
 test_date () {
@@ -362,6 +387,8 @@ test_expect_success 'setup for upstream:track[short]' '
 
 test_atom head upstream:track '[ahead 1]'
 test_atom head upstream:trackshort '>'
+test_atom head upstream:track,nobracket 'ahead 1'
+test_atom head upstream:nobracket,track 'ahead 1'
 test_atom head push:track '[ahead 1]'
 test_atom head push:trackshort '>'
 
@@ -372,7 +399,7 @@ test_expect_success 'Check that :track[short] cannot be used with other atoms' '
 
 test_expect_success 'Check that :track[short] works when upstream is invalid' '
 	cat >expected <<-\EOF &&
-
+	[gone]
 
 	EOF
 	test_when_finished "git config branch.master.merge refs/heads/master" &&
@@ -387,21 +414,37 @@ test_expect_success 'Check for invalid refname format' '
 	test_must_fail git for-each-ref --format="%(refname:INVALID)"
 '
 
-get_color ()
-{
-	git config --get-color no.such.slot "$1"
-}
+test_expect_success 'set up color tests' '
+	cat >expected.color <<-EOF &&
+	$(git rev-parse --short refs/heads/master) <GREEN>master<RESET>
+	$(git rev-parse --short refs/remotes/origin/master) <GREEN>origin/master<RESET>
+	$(git rev-parse --short refs/tags/testtag) <GREEN>testtag<RESET>
+	$(git rev-parse --short refs/tags/two) <GREEN>two<RESET>
+	EOF
+	sed "s/<[^>]*>//g" <expected.color >expected.bare &&
+	color_format="%(objectname:short) %(color:green)%(refname:short)"
+'
 
-cat >expected <<EOF
-$(git rev-parse --short refs/heads/master) $(get_color green)master$(get_color reset)
-$(git rev-parse --short refs/remotes/origin/master) $(get_color green)origin/master$(get_color reset)
-$(git rev-parse --short refs/tags/testtag) $(get_color green)testtag$(get_color reset)
-$(git rev-parse --short refs/tags/two) $(get_color green)two$(get_color reset)
-EOF
+test_expect_success TTY '%(color) shows color with a tty' '
+	test_terminal git for-each-ref --format="$color_format" >actual.raw &&
+	test_decode_color <actual.raw >actual &&
+	test_cmp expected.color actual
+'
 
-test_expect_success 'Check %(color:...) ' '
-	git for-each-ref --format="%(objectname:short) %(color:green)%(refname:short)" >actual &&
-	test_cmp expected actual
+test_expect_success '%(color) does not show color without tty' '
+	TERM=vt100 git for-each-ref --format="$color_format" >actual &&
+	test_cmp expected.bare actual
+'
+
+test_expect_success '--color can override tty check' '
+	git for-each-ref --color --format="$color_format" >actual.raw &&
+	test_decode_color <actual.raw >actual &&
+	test_cmp expected.color actual
+'
+
+test_expect_success 'color.ui=always does not override tty check' '
+	git -c color.ui=always for-each-ref --format="$color_format" >actual &&
+	test_cmp expected.bare actual
 '
 
 cat >expected <<\EOF
@@ -553,4 +596,174 @@ test_expect_success 'Verify sort with multiple keys' '
 		refs/tags/bogo refs/tags/master > actual &&
 	test_cmp expected actual
 '
+
+
+test_expect_success 'do not dereference NULL upon %(HEAD) on unborn branch' '
+	test_when_finished "git checkout master" &&
+	git for-each-ref --format="%(HEAD) %(refname:short)" refs/heads/ >actual &&
+	sed -e "s/^\* /  /" actual >expect &&
+	git checkout --orphan orphaned-branch &&
+	git for-each-ref --format="%(HEAD) %(refname:short)" refs/heads/ >actual &&
+	test_cmp expect actual
+'
+
+cat >trailers <<EOF
+Reviewed-by: A U Thor <author@example.com>
+Signed-off-by: A U Thor <author@example.com>
+[ v2 updated patch description ]
+Acked-by: A U Thor
+  <author@example.com>
+EOF
+
+unfold () {
+	perl -0pe 's/\n\s+/ /g'
+}
+
+test_expect_success 'set up trailers for next test' '
+	echo "Some contents" > two &&
+	git add two &&
+	git commit -F - <<-EOF
+	trailers: this commit message has trailers
+
+	Some message contents
+
+	$(cat trailers)
+	EOF
+'
+
+test_expect_success '%(trailers:unfold) unfolds trailers' '
+	git for-each-ref --format="%(trailers:unfold)" refs/heads/master >actual &&
+	{
+		unfold <trailers
+		echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success '%(trailers:only) shows only "key: value" trailers' '
+	git for-each-ref --format="%(trailers:only)" refs/heads/master >actual &&
+	{
+		grep -v patch.description <trailers &&
+		echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success '%(trailers:only) and %(trailers:unfold) work together' '
+	git for-each-ref --format="%(trailers:only,unfold)" refs/heads/master >actual &&
+	git for-each-ref --format="%(trailers:unfold,only)" refs/heads/master >reverse &&
+	test_cmp actual reverse &&
+	{
+		grep -v patch.description <trailers | unfold &&
+		echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success '%(contents:trailers:unfold) unfolds trailers' '
+	git for-each-ref --format="%(contents:trailers:unfold)" refs/heads/master >actual &&
+	{
+		unfold <trailers
+		echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success '%(contents:trailers:only) shows only "key: value" trailers' '
+	git for-each-ref --format="%(contents:trailers:only)" refs/heads/master >actual &&
+	{
+		grep -v patch.description <trailers &&
+		echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success '%(contents:trailers:only) and %(contents:trailers:unfold) work together' '
+	git for-each-ref --format="%(contents:trailers:only,unfold)" refs/heads/master >actual &&
+	git for-each-ref --format="%(contents:trailers:unfold,only)" refs/heads/master >reverse &&
+	test_cmp actual reverse &&
+	{
+		grep -v patch.description <trailers | unfold &&
+		echo
+	} >expect &&
+	test_cmp expect actual
+'
+
+test_expect_success '%(trailers) rejects unknown trailers arguments' '
+	# error message cannot be checked under i18n
+	cat >expect <<-EOF &&
+	fatal: unknown %(trailers) argument: unsupported
+	EOF
+	test_must_fail git for-each-ref --format="%(trailers:unsupported)" 2>actual &&
+	test_i18ncmp expect actual
+'
+
+test_expect_success '%(contents:trailers) rejects unknown trailers arguments' '
+	# error message cannot be checked under i18n
+	cat >expect <<-EOF &&
+	fatal: unknown %(trailers) argument: unsupported
+	EOF
+	test_must_fail git for-each-ref --format="%(contents:trailers:unsupported)" 2>actual &&
+	test_i18ncmp expect actual
+'
+
+test_expect_success 'basic atom: head contents:trailers' '
+	git for-each-ref --format="%(contents:trailers)" refs/heads/master >actual &&
+	sanitize_pgp <actual >actual.clean &&
+	# git for-each-ref ends with a blank line
+	cat >expect <<-EOF &&
+	$(cat trailers)
+
+	EOF
+	test_cmp expect actual.clean
+'
+
+test_expect_success 'Add symbolic ref for the following tests' '
+	git symbolic-ref refs/heads/sym refs/heads/master
+'
+
+cat >expected <<EOF
+refs/heads/master
+EOF
+
+test_expect_success 'Verify usage of %(symref) atom' '
+	git for-each-ref --format="%(symref)" refs/heads/sym >actual &&
+	test_cmp expected actual
+'
+
+cat >expected <<EOF
+heads/master
+EOF
+
+test_expect_success 'Verify usage of %(symref:short) atom' '
+	git for-each-ref --format="%(symref:short)" refs/heads/sym >actual &&
+	test_cmp expected actual
+'
+
+cat >expected <<EOF
+master
+heads/master
+EOF
+
+test_expect_success 'Verify usage of %(symref:lstrip) atom' '
+	git for-each-ref --format="%(symref:lstrip=2)" refs/heads/sym > actual &&
+	git for-each-ref --format="%(symref:lstrip=-2)" refs/heads/sym >> actual &&
+	test_cmp expected actual &&
+
+	git for-each-ref --format="%(symref:strip=2)" refs/heads/sym > actual &&
+	git for-each-ref --format="%(symref:strip=-2)" refs/heads/sym >> actual &&
+	test_cmp expected actual
+'
+
+cat >expected <<EOF
+refs
+refs/heads
+EOF
+
+test_expect_success 'Verify usage of %(symref:rstrip) atom' '
+	git for-each-ref --format="%(symref:rstrip=2)" refs/heads/sym > actual &&
+	git for-each-ref --format="%(symref:rstrip=-2)" refs/heads/sym >> actual &&
+	test_cmp expected actual
+'
+
 test_done

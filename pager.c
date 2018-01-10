@@ -1,4 +1,5 @@
 #include "cache.h"
+#include "config.h"
 #include "run-command.h"
 #include "sigchain.h"
 
@@ -6,12 +7,8 @@
 #define DEFAULT_PAGER "less"
 #endif
 
-/*
- * This is split up from the rest of git so that we can do
- * something different on Windows.
- */
-
 static struct child_process pager_process = CHILD_PROCESS_INIT;
+static const char *pager_program;
 
 static void wait_for_pager(int in_signal)
 {
@@ -40,6 +37,13 @@ static void wait_for_pager_signal(int signo)
 	raise(signo);
 }
 
+static int core_pager_config(const char *var, const char *value, void *data)
+{
+	if (!strcmp(var, "core.pager"))
+		return git_config_string(&pager_program, var, value);
+	return 0;
+}
+
 const char *git_pager(int stdout_is_tty)
 {
 	const char *pager;
@@ -50,7 +54,7 @@ const char *git_pager(int stdout_is_tty)
 	pager = getenv("GIT_PAGER");
 	if (!pager) {
 		if (!pager_program)
-			git_config(git_default_config, NULL);
+			read_early_config(core_pager_config, NULL);
 		pager = pager_program;
 	}
 	if (!pager)
@@ -63,14 +67,38 @@ const char *git_pager(int stdout_is_tty)
 	return pager;
 }
 
+static void setup_pager_env(struct argv_array *env)
+{
+	const char **argv;
+	int i;
+	char *pager_env = xstrdup(PAGER_ENV);
+	int n = split_cmdline(pager_env, &argv);
+
+	if (n < 0)
+		die("malformed build-time PAGER_ENV: %s",
+			split_cmdline_strerror(n));
+
+	for (i = 0; i < n; i++) {
+		char *cp = strchr(argv[i], '=');
+
+		if (!cp)
+			die("malformed build-time PAGER_ENV");
+
+		*cp = '\0';
+		if (!getenv(argv[i])) {
+			*cp = '=';
+			argv_array_push(env, argv[i]);
+		}
+	}
+	free(pager_env);
+	free(argv);
+}
+
 void prepare_pager_args(struct child_process *pager_process, const char *pager)
 {
 	argv_array_push(&pager_process->args, pager);
 	pager_process->use_shell = 1;
-	if (!getenv("LESS"))
-		argv_array_push(&pager_process->env_array, "LESS=FRX");
-	if (!getenv("LV"))
-		argv_array_push(&pager_process->env_array, "LV=-c");
+	setup_pager_env(&pager_process->env_array);
 }
 
 void setup_pager(void)
@@ -108,9 +136,7 @@ void setup_pager(void)
 
 int pager_in_use(void)
 {
-	const char *env;
-	env = getenv("GIT_PAGER_IN_USE");
-	return env ? git_config_bool("GIT_PAGER_IN_USE", env) : 0;
+	return git_env_bool("GIT_PAGER_IN_USE", 0);
 }
 
 /*
@@ -156,23 +182,42 @@ int decimal_width(uintmax_t number)
 	return width;
 }
 
+struct pager_command_config_data {
+	const char *cmd;
+	int want;
+	char *value;
+};
+
+static int pager_command_config(const char *var, const char *value, void *vdata)
+{
+	struct pager_command_config_data *data = vdata;
+	const char *cmd;
+
+	if (skip_prefix(var, "pager.", &cmd) && !strcmp(cmd, data->cmd)) {
+		int b = git_parse_maybe_bool(value);
+		if (b >= 0)
+			data->want = b;
+		else {
+			data->want = 1;
+			data->value = xstrdup(value);
+		}
+	}
+
+	return 0;
+}
+
 /* returns 0 for "no pager", 1 for "use pager", and -1 for "not specified" */
 int check_pager_config(const char *cmd)
 {
-	int want = -1;
-	struct strbuf key = STRBUF_INIT;
-	const char *value = NULL;
-	strbuf_addf(&key, "pager.%s", cmd);
-	if (git_config_key_is_valid(key.buf) &&
-	    !git_config_get_value(key.buf, &value)) {
-		int b = git_config_maybe_bool(key.buf, value);
-		if (b >= 0)
-			want = b;
-		else {
-			want = 1;
-			pager_program = xstrdup(value);
-		}
-	}
-	strbuf_release(&key);
-	return want;
+	struct pager_command_config_data data;
+
+	data.cmd = cmd;
+	data.want = -1;
+	data.value = NULL;
+
+	read_early_config(pager_command_config, &data);
+
+	if (data.value)
+		pager_program = data.value;
+	return data.want;
 }

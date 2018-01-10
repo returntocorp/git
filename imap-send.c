@@ -23,6 +23,7 @@
  */
 
 #include "cache.h"
+#include "config.h"
 #include "credential.h"
 #include "exec_cmd.h"
 #include "run-command.h"
@@ -34,11 +35,11 @@ typedef void *SSL;
 #include "http.h"
 #endif
 
-#if defined(USE_CURL_FOR_IMAP_SEND) && defined(NO_OPENSSL)
-/* only available option */
+#if defined(USE_CURL_FOR_IMAP_SEND)
+/* Always default to curl if it's available. */
 #define USE_CURL_DEFAULT 1
 #else
-/* strictly opt in */
+/* We don't have curl, so continue to use the historical implementation */
 #define USE_CURL_DEFAULT 0
 #endif
 
@@ -511,7 +512,7 @@ static int nfsnprintf(char *buf, int blen, const char *fmt, ...)
 
 	va_start(va, fmt);
 	if (blen <= 0 || (unsigned)(ret = vsnprintf(buf, blen, fmt, va)) >= (unsigned)blen)
-		die("Fatal: buffer too small. Please report a bug.");
+		die("BUG: buffer too small. Please report a bug.");
 	va_end(va);
 	return ret;
 }
@@ -776,8 +777,7 @@ static int get_cmd_result(struct imap_store *ctx, struct imap_cmd *tcmd)
 			       offsetof(struct imap_cmd, next));
 			if (cmdp->cb.data) {
 				n = socket_write(&imap->buf.sock, cmdp->cb.data, cmdp->cb.dlen);
-				free(cmdp->cb.data);
-				cmdp->cb.data = NULL;
+				FREE_AND_NULL(cmdp->cb.data);
 				if (n != (int)cmdp->cb.dlen)
 					return RESP_BAD;
 			} else if (cmdp->cb.cont) {
@@ -861,7 +861,7 @@ static char hexchar(unsigned int b)
 	return b < 10 ? '0' + b : 'a' + (b - 10);
 }
 
-#define ENCODED_SIZE(n) (4*((n+2)/3))
+#define ENCODED_SIZE(n) (4 * DIV_ROUND_UP((n), 3))
 static char *cram(const char *challenge_64, const char *user, const char *pass)
 {
 	int i, resp_len, encoded_len, decoded_len;
@@ -926,6 +926,25 @@ static int auth_cram_md5(struct imap_store *ctx, struct imap_cmd *cmd, const cha
 	return 0;
 }
 
+static void server_fill_credential(struct imap_server_conf *srvc, struct credential *cred)
+{
+	if (srvc->user && srvc->pass)
+		return;
+
+	cred->protocol = xstrdup(srvc->use_ssl ? "imaps" : "imap");
+	cred->host = xstrdup(srvc->host);
+
+	cred->username = xstrdup_or_null(srvc->user);
+	cred->password = xstrdup_or_null(srvc->pass);
+
+	credential_fill(cred);
+
+	if (!srvc->user)
+		srvc->user = xstrdup(cred->username);
+	if (!srvc->pass)
+		srvc->pass = xstrdup(cred->password);
+}
+
 static struct imap_store *imap_open_store(struct imap_server_conf *srvc, char *folder)
 {
 	struct credential cred = CREDENTIAL_INIT;
@@ -964,7 +983,7 @@ static struct imap_store *imap_open_store(struct imap_server_conf *srvc, char *f
 		int gai;
 		char portstr[6];
 
-		snprintf(portstr, sizeof(portstr), "%d", srvc->port);
+		xsnprintf(portstr, sizeof(portstr), "%d", srvc->port);
 
 		memset(&hints, 0, sizeof(hints));
 		hints.ai_socktype = SOCK_STREAM;
@@ -1078,22 +1097,7 @@ static struct imap_store *imap_open_store(struct imap_server_conf *srvc, char *f
 		}
 #endif
 		imap_info("Logging in...\n");
-		if (!srvc->user || !srvc->pass) {
-			cred.protocol = xstrdup(srvc->use_ssl ? "imaps" : "imap");
-			cred.host = xstrdup(srvc->host);
-
-			if (srvc->user)
-				cred.username = xstrdup(srvc->user);
-			if (srvc->pass)
-				cred.password = xstrdup(srvc->pass);
-
-			credential_fill(&cred);
-
-			if (!srvc->user)
-				srvc->user = xstrdup(cred.username);
-			if (!srvc->pass)
-				srvc->pass = xstrdup(cred.password);
-		}
+		server_fill_credential(srvc, &cred);
 
 		if (srvc->auth_method) {
 			struct imap_cmd_cb cb;
@@ -1394,7 +1398,7 @@ static int append_msgs_to_imap(struct imap_server_conf *server,
 }
 
 #ifdef USE_CURL_FOR_IMAP_SEND
-static CURL *setup_curl(struct imap_server_conf *srvc)
+static CURL *setup_curl(struct imap_server_conf *srvc, struct credential *cred)
 {
 	CURL *curl;
 	struct strbuf path = STRBUF_INIT;
@@ -1407,9 +1411,11 @@ static CURL *setup_curl(struct imap_server_conf *srvc)
 	if (!curl)
 		die("curl_easy_init failed");
 
+	server_fill_credential(&server, cred);
 	curl_easy_setopt(curl, CURLOPT_USERNAME, server.user);
 	curl_easy_setopt(curl, CURLOPT_PASSWORD, server.pass);
 
+	strbuf_addstr(&path, server.use_ssl ? "imaps://" : "imap://");
 	strbuf_addstr(&path, server.host);
 	if (!path.len || path.buf[path.len - 1] != '/')
 		strbuf_addch(&path, '/');
@@ -1443,6 +1449,7 @@ static CURL *setup_curl(struct imap_server_conf *srvc)
 
 	if (0 < verbosity || getenv("GIT_CURL_VERBOSE"))
 		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+	setup_curl_trace(curl);
 
 	return curl;
 }
@@ -1454,8 +1461,9 @@ static int curl_append_msgs_to_imap(struct imap_server_conf *server,
 	struct buffer msgbuf = { STRBUF_INIT, 0 };
 	CURL *curl;
 	CURLcode res = CURLE_OK;
+	struct credential cred = CREDENTIAL_INIT;
 
-	curl = setup_curl(server);
+	curl = setup_curl(server, &cred);
 	curl_easy_setopt(curl, CURLOPT_READDATA, &msgbuf);
 
 	fprintf(stderr, "sending %d message%s\n", total, (total != 1) ? "s" : "");
@@ -1490,7 +1498,20 @@ static int curl_append_msgs_to_imap(struct imap_server_conf *server,
 	curl_easy_cleanup(curl);
 	curl_global_cleanup();
 
-	return 0;
+	if (cred.username) {
+		if (res == CURLE_OK)
+			credential_approve(&cred);
+#if LIBCURL_VERSION_NUM >= 0x070d01
+		else if (res == CURLE_LOGIN_DENIED)
+#else
+		else
+#endif
+			credential_reject(&cred);
+	}
+
+	credential_clear(&cred);
+
+	return res != CURLE_OK;
 }
 #endif
 

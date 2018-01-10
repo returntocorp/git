@@ -52,6 +52,9 @@ TEST_NO_MALLOC_CHECK=t
 # need to export them for test_perf subshells
 export TEST_DIRECTORY TRASH_DIRECTORY GIT_BUILD_DIR GIT_TEST_CMP
 
+MODERN_GIT=$GIT_BUILD_DIR/bin-wrappers/git
+export MODERN_GIT
+
 perf_results_dir=$TEST_OUTPUT_DIRECTORY/test-results
 mkdir -p "$perf_results_dir"
 rm -f "$perf_results_dir"/$(basename "$0" .sh).subtests
@@ -75,13 +78,17 @@ if test -z "$GIT_PERF_LARGE_REPO"; then
 	GIT_PERF_LARGE_REPO=$TEST_DIRECTORY/..
 fi
 
+test_perf_do_repo_symlink_config_ () {
+	test_have_prereq SYMLINKS || git config core.symlinks false
+}
+
 test_perf_create_repo_from () {
 	test "$#" = 2 ||
 	error "bug in the test script: not 2 parameters to test-create-repo"
 	repo="$1"
 	source="$2"
-	source_git="$(git -C "$source" rev-parse --git-dir)"
-	objects_dir="$(git -C "$source" rev-parse --git-path objects)"
+	source_git="$("$MODERN_GIT" -C "$source" rev-parse --git-dir)"
+	objects_dir="$("$MODERN_GIT" -C "$source" rev-parse --git-path objects)"
 	mkdir -p "$repo/.git"
 	(
 		cd "$source" &&
@@ -99,15 +106,29 @@ test_perf_create_repo_from () {
 	) &&
 	(
 		cd "$repo" &&
-		git init -q && {
-			test_have_prereq SYMLINKS ||
-			git config core.symlinks false
-		} &&
-		mv .git/hooks .git/hooks-disabled 2>/dev/null
+		"$MODERN_GIT" init -q &&
+		test_perf_do_repo_symlink_config_ &&
+		mv .git/hooks .git/hooks-disabled 2>/dev/null &&
+		if test -f .git/index.lock
+		then
+			# We may be copying a repo that can't run "git
+			# status" due to a locked index. Since we have
+			# a copy it's fine to remove the lock.
+			rm .git/index.lock
+		fi
 	) || error "failed to copy repository '$source' to '$repo'"
 }
 
 # call at least one of these to establish an appropriately-sized repository
+test_perf_fresh_repo () {
+	repo="${1:-$TRASH_DIRECTORY}"
+	"$MODERN_GIT" init -q "$repo" &&
+	(
+		cd "$repo" &&
+		test_perf_do_repo_symlink_config_
+	)
+}
+
 test_perf_default_repo () {
 	test_perf_create_repo_from "${1:-$TRASH_DIRECTORY}" "$GIT_PERF_REPO"
 }

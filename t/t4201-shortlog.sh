@@ -184,4 +184,29 @@ test_expect_success 'shortlog with revision pseudo options' '
 	git shortlog --exclude=refs/heads/m* --all
 '
 
+test_expect_success 'shortlog with --output=<file>' '
+	git shortlog --output=shortlog -1 master >output &&
+	test ! -s output &&
+	test_line_count = 3 shortlog
+'
+
+test_expect_success 'shortlog --committer (internal)' '
+	git checkout --orphan side &&
+	git commit --allow-empty -m one &&
+	git commit --allow-empty -m two &&
+	GIT_COMMITTER_NAME="Sin Nombre" git commit --allow-empty -m three &&
+
+	cat >expect <<-\EOF &&
+	     2	C O Mitter
+	     1	Sin Nombre
+	EOF
+	git shortlog -nsc HEAD >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success 'shortlog --committer (external)' '
+	git log --format=full | git shortlog -nsc >actual &&
+	test_cmp expect actual
+'
+
 test_done

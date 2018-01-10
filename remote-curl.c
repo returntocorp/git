@@ -1,4 +1,5 @@
 #include "cache.h"
+#include "config.h"
 #include "remote.h"
 #include "strbuf.h"
 #include "walker.h"
@@ -20,6 +21,9 @@ static struct strbuf url = STRBUF_INIT;
 struct options {
 	int verbosity;
 	unsigned long depth;
+	char *deepen_since;
+	struct string_list deepen_not;
+	struct string_list push_options;
 	unsigned progress : 1,
 		check_self_contained_and_connected : 1,
 		cloning : 1,
@@ -28,7 +32,8 @@ struct options {
 		dry_run : 1,
 		thin : 1,
 		/* One of the SEND_PACK_PUSH_CERT_* constants. */
-		push_cert : 2;
+		push_cert : 2,
+		deepen_relative : 1;
 };
 static struct options options;
 static struct string_list cas_options = STRING_LIST_INIT_DUP;
@@ -58,6 +63,23 @@ static int set_option(const char *name, const char *value)
 		if (value == end || *end)
 			return -1;
 		options.depth = v;
+		return 0;
+	}
+	else if (!strcmp(name, "deepen-since")) {
+		options.deepen_since = xstrdup(value);
+		return 0;
+	}
+	else if (!strcmp(name, "deepen-not")) {
+		string_list_append(&options.deepen_not, value);
+		return 0;
+	}
+	else if (!strcmp(name, "deepen-relative")) {
+		if (!strcmp(value, "true"))
+			options.deepen_relative = 1;
+		else if (!strcmp(value, "false"))
+			options.deepen_relative = 0;
+		else
+			return -1;
 		return 0;
 	}
 	else if (!strcmp(name, "followtags")) {
@@ -119,6 +141,9 @@ static int set_option(const char *name, const char *value)
 		else
 			return -1;
 		return 0;
+	} else if (!strcmp(name, "push-option")) {
+		string_list_append(&options.push_options, value);
+		return 0;
 
 #if LIBCURL_VERSION_NUM >= 0x070a08
 	} else if (!strcmp(name, "family")) {
@@ -143,7 +168,7 @@ struct discovery {
 	char *buf;
 	size_t len;
 	struct ref *refs;
-	struct sha1_array shallow;
+	struct oid_array shallow;
 	unsigned proto_git : 1;
 };
 static struct discovery *last_discovery;
@@ -210,7 +235,7 @@ static void free_discovery(struct discovery *d)
 	if (d) {
 		if (d == last_discovery)
 			last_discovery = NULL;
-		free(d->shallow.sha1);
+		free(d->shallow.oid);
 		free(d->buf_alloc);
 		free_refs(d->refs);
 		free(d);
@@ -254,7 +279,7 @@ static struct discovery *discover_refs(const char *service, int for_push)
 	struct strbuf effective_url = STRBUF_INIT;
 	struct discovery *last = last_discovery;
 	int http_ret, maybe_smart = 0;
-	struct http_get_options options;
+	struct http_get_options http_options;
 
 	if (last && !strcmp(service, last->service))
 		return last;
@@ -271,15 +296,16 @@ static struct discovery *discover_refs(const char *service, int for_push)
 		strbuf_addf(&refs_url, "service=%s", service);
 	}
 
-	memset(&options, 0, sizeof(options));
-	options.content_type = &type;
-	options.charset = &charset;
-	options.effective_url = &effective_url;
-	options.base_url = &url;
-	options.no_cache = 1;
-	options.keep_error = 1;
+	memset(&http_options, 0, sizeof(http_options));
+	http_options.content_type = &type;
+	http_options.charset = &charset;
+	http_options.effective_url = &effective_url;
+	http_options.base_url = &url;
+	http_options.initial_request = 1;
+	http_options.no_cache = 1;
+	http_options.keep_error = 1;
 
-	http_ret = http_get_strbuf(refs_url.buf, &buffer, &options);
+	http_ret = http_get_strbuf(refs_url.buf, &buffer, &http_options);
 	switch (http_ret) {
 	case HTTP_OK:
 		break;
@@ -293,6 +319,9 @@ static struct discovery *discover_refs(const char *service, int for_push)
 		show_http_message(&type, &charset, &buffer);
 		die("unable to access '%s': %s", url.buf, curl_errorstr);
 	}
+
+	if (options.verbosity && !starts_with(refs_url.buf, url.buf))
+		warning(_("redirecting to %s"), url.buf);
 
 	last= xcalloc(1, sizeof(*last_discovery));
 	last->service = service;
@@ -380,6 +409,7 @@ struct rpc_state {
 	size_t pos;
 	int in;
 	int out;
+	int any_written;
 	struct strbuf result;
 	unsigned gzip_request : 1;
 	unsigned initial_buffer : 1;
@@ -436,6 +466,8 @@ static size_t rpc_in(char *ptr, size_t eltsize,
 {
 	size_t size = eltsize * nmemb;
 	struct rpc_state *rpc = buffer_;
+	if (size)
+		rpc->any_written = 1;
 	write_or_die(rpc->in, ptr, size);
 	return size;
 }
@@ -498,6 +530,12 @@ static int probe_rpc(struct rpc_state *rpc, struct slot_results *results)
 	curl_slist_free_all(headers);
 	strbuf_release(&buf);
 	return err;
+}
+
+static curl_off_t xcurl_off_t(ssize_t len) {
+	if (len > maximum_signed_value_of_type(curl_off_t))
+		die("cannot handle pushes this big");
+	return (curl_off_t) len;
 }
 
 static int post_rpc(struct rpc_state *rpc)
@@ -583,7 +621,7 @@ retry:
 		 * and we just need to send it.
 		 */
 		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDS, gzip_body);
-		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE, gzip_size);
+		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE_LARGE, xcurl_off_t(gzip_size));
 
 	} else if (use_gzip && 1024 < rpc->len) {
 		/* The client backend isn't giving us compressed data so
@@ -614,7 +652,7 @@ retry:
 
 		headers = curl_slist_append(headers, "Content-Encoding: gzip");
 		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDS, gzip_body);
-		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE, gzip_size);
+		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE_LARGE, xcurl_off_t(gzip_size));
 
 		if (options.verbosity > 1) {
 			fprintf(stderr, "POST %s (gzip %lu to %lu bytes)\n",
@@ -627,7 +665,7 @@ retry:
 		 * more normal Content-Length approach.
 		 */
 		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDS, rpc->buf);
-		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE, rpc->len);
+		curl_easy_setopt(slot->curl, CURLOPT_POSTFIELDSIZE_LARGE, xcurl_off_t(rpc->len));
 		if (options.verbosity > 1) {
 			fprintf(stderr, "POST %s (%lu bytes)\n",
 				rpc->service_name, (unsigned long)rpc->len);
@@ -639,12 +677,17 @@ retry:
 	curl_easy_setopt(slot->curl, CURLOPT_WRITEFUNCTION, rpc_in);
 	curl_easy_setopt(slot->curl, CURLOPT_FILE, rpc);
 
+
+	rpc->any_written = 0;
 	err = run_slot(slot, NULL);
 	if (err == HTTP_REAUTH && !large_request) {
 		credential_fill(&http_auth);
 		goto retry;
 	}
 	if (err != HTTP_OK)
+		err = -1;
+
+	if (!rpc->any_written)
 		err = -1;
 
 	curl_slist_free_all(headers);
@@ -725,8 +768,8 @@ static int fetch_dumb(int nr_heads, struct ref **to_fetch)
 	int ret, i;
 
 	ALLOC_ARRAY(targets, nr_heads);
-	if (options.depth)
-		die("dumb http transport does not support --depth");
+	if (options.depth || options.deepen_since)
+		die("dumb http transport does not support shallow capabilities");
 	for (i = 0; i < nr_heads; i++)
 		targets[i] = xstrdup(oid_to_hex(&to_fetch[i]->old_oid));
 
@@ -751,38 +794,35 @@ static int fetch_git(struct discovery *heads,
 {
 	struct rpc_state rpc;
 	struct strbuf preamble = STRBUF_INIT;
-	char *depth_arg = NULL;
-	int argc = 0, i, err;
-	const char *argv[17];
+	int i, err;
+	struct argv_array args = ARGV_ARRAY_INIT;
 
-	argv[argc++] = "fetch-pack";
-	argv[argc++] = "--stateless-rpc";
-	argv[argc++] = "--stdin";
-	argv[argc++] = "--lock-pack";
+	argv_array_pushl(&args, "fetch-pack", "--stateless-rpc",
+			 "--stdin", "--lock-pack", NULL);
 	if (options.followtags)
-		argv[argc++] = "--include-tag";
+		argv_array_push(&args, "--include-tag");
 	if (options.thin)
-		argv[argc++] = "--thin";
-	if (options.verbosity >= 3) {
-		argv[argc++] = "-v";
-		argv[argc++] = "-v";
-	}
+		argv_array_push(&args, "--thin");
+	if (options.verbosity >= 3)
+		argv_array_pushl(&args, "-v", "-v", NULL);
 	if (options.check_self_contained_and_connected)
-		argv[argc++] = "--check-self-contained-and-connected";
+		argv_array_push(&args, "--check-self-contained-and-connected");
 	if (options.cloning)
-		argv[argc++] = "--cloning";
+		argv_array_push(&args, "--cloning");
 	if (options.update_shallow)
-		argv[argc++] = "--update-shallow";
+		argv_array_push(&args, "--update-shallow");
 	if (!options.progress)
-		argv[argc++] = "--no-progress";
-	if (options.depth) {
-		struct strbuf buf = STRBUF_INIT;
-		strbuf_addf(&buf, "--depth=%lu", options.depth);
-		depth_arg = strbuf_detach(&buf, NULL);
-		argv[argc++] = depth_arg;
-	}
-	argv[argc++] = url.buf;
-	argv[argc++] = NULL;
+		argv_array_push(&args, "--no-progress");
+	if (options.depth)
+		argv_array_pushf(&args, "--depth=%lu", options.depth);
+	if (options.deepen_since)
+		argv_array_pushf(&args, "--shallow-since=%s", options.deepen_since);
+	for (i = 0; i < options.deepen_not.nr; i++)
+		argv_array_pushf(&args, "--shallow-exclude=%s",
+				 options.deepen_not.items[i].string);
+	if (options.deepen_relative && options.depth)
+		argv_array_push(&args, "--deepen-relative");
+	argv_array_push(&args, url.buf);
 
 	for (i = 0; i < nr_heads; i++) {
 		struct ref *ref = to_fetch[i];
@@ -795,7 +835,7 @@ static int fetch_git(struct discovery *heads,
 
 	memset(&rpc, 0, sizeof(rpc));
 	rpc.service_name = "git-upload-pack",
-	rpc.argv = argv;
+	rpc.argv = args.argv;
 	rpc.stdin_preamble = &preamble;
 	rpc.gzip_request = 1;
 
@@ -804,7 +844,7 @@ static int fetch_git(struct discovery *heads,
 		write_or_die(1, rpc.result.buf, rpc.result.len);
 	strbuf_release(&rpc.result);
 	strbuf_release(&preamble);
-	free(depth_arg);
+	argv_array_clear(&args);
 	return err;
 }
 
@@ -914,6 +954,9 @@ static int push_git(struct discovery *heads, int nr_spec, char **specs)
 		argv_array_push(&args, "--quiet");
 	else if (options.verbosity > 1)
 		argv_array_push(&args, "--verbose");
+	for (i = 0; i < options.push_options.nr; i++)
+		argv_array_pushf(&args, "--push-option=%s",
+				 options.push_options.items[i].string);
 	argv_array_push(&args, options.progress ? "--progress" : "--no-progress");
 	for_each_string_list_item(cas_option, &cas_options)
 		argv_array_push(&args, cas_option->string);
@@ -998,6 +1041,8 @@ int cmd_main(int argc, const char **argv)
 	options.verbosity = 1;
 	options.progress = !!isatty(2);
 	options.thin = 1;
+	string_list_init(&options.deepen_not, 1);
+	string_list_init(&options.push_options, 1);
 
 	remote = remote_get(argv[1]);
 

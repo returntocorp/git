@@ -11,6 +11,7 @@
  */
 
 #include "builtin.h"
+#include "config.h"
 #include "tempfile.h"
 #include "lockfile.h"
 #include "parse-options.h"
@@ -18,6 +19,7 @@
 #include "sigchain.h"
 #include "argv-array.h"
 #include "commit.h"
+#include "packfile.h"
 
 #define FAILED_RUN "failed to run %s"
 
@@ -28,11 +30,13 @@ static const char * const builtin_gc_usage[] = {
 
 static int pack_refs = 1;
 static int prune_reflogs = 1;
-static int aggressive_depth = 250;
+static int aggressive_depth = 50;
 static int aggressive_window = 250;
 static int gc_auto_threshold = 6700;
 static int gc_auto_pack_limit = 50;
 static int detach_auto = 1;
+static timestamp_t gc_log_expire_time;
+static const char *gc_log_expire = "1.day.ago";
 static const char *prune_expire = "2.weeks.ago";
 static const char *prune_worktrees_expire = "3.months.ago";
 
@@ -43,7 +47,7 @@ static struct argv_array prune = ARGV_ARRAY_INIT;
 static struct argv_array prune_worktrees = ARGV_ARRAY_INIT;
 static struct argv_array rerere = ARGV_ARRAY_INIT;
 
-static struct tempfile pidfile;
+static struct tempfile *pidfile;
 static struct lock_file log_lock;
 
 static struct string_list pack_garbage = STRING_LIST_INIT_DUP;
@@ -62,24 +66,31 @@ static void report_pack_garbage(unsigned seen_bits, const char *path)
 		string_list_append(&pack_garbage, path);
 }
 
-static void git_config_date_string(const char *key, const char **output)
-{
-	if (git_config_get_string_const(key, output))
-		return;
-	if (strcmp(*output, "now")) {
-		unsigned long now = approxidate("now");
-		if (approxidate(*output) >= now)
-			git_die_config(key, _("Invalid %s: '%s'"), key, *output);
-	}
-}
-
 static void process_log_file(void)
 {
 	struct stat st;
-	if (!fstat(get_lock_file_fd(&log_lock), &st) && st.st_size)
+	if (fstat(get_lock_file_fd(&log_lock), &st)) {
+		/*
+		 * Perhaps there was an i/o error or another
+		 * unlikely situation.  Try to make a note of
+		 * this in gc.log along with any existing
+		 * messages.
+		 */
+		int saved_errno = errno;
+		fprintf(stderr, _("Failed to fstat %s: %s"),
+			get_tempfile_path(log_lock.tempfile),
+			strerror(saved_errno));
+		fflush(stderr);
 		commit_lock_file(&log_lock);
-	else
+		errno = saved_errno;
+	} else if (st.st_size) {
+		/* There was some error recorded in the lock file */
+		commit_lock_file(&log_lock);
+	} else {
+		/* No error, clean up any old gc.log */
+		unlink(git_path("gc.log"));
 		rollback_lock_file(&log_lock);
+	}
 }
 
 static void process_log_file_at_exit(void)
@@ -111,8 +122,10 @@ static void gc_config(void)
 	git_config_get_int("gc.auto", &gc_auto_threshold);
 	git_config_get_int("gc.autopacklimit", &gc_auto_pack_limit);
 	git_config_get_bool("gc.autodetach", &detach_auto);
-	git_config_date_string("gc.pruneexpire", &prune_expire);
-	git_config_date_string("gc.worktreepruneexpire", &prune_worktrees_expire);
+	git_config_get_expiry("gc.pruneexpire", &prune_expire);
+	git_config_get_expiry("gc.worktreepruneexpire", &prune_worktrees_expire);
+	git_config_get_expiry("gc.logexpiry", &gc_log_expire);
+
 	git_config(git_default_config, NULL);
 }
 
@@ -124,8 +137,6 @@ static int too_many_loose_objects(void)
 	 * distributed, we can check only one and get a reasonable
 	 * estimate.
 	 */
-	char path[PATH_MAX];
-	const char *objdir = get_object_directory();
 	DIR *dir;
 	struct dirent *ent;
 	int auto_threshold;
@@ -135,15 +146,11 @@ static int too_many_loose_objects(void)
 	if (gc_auto_threshold <= 0)
 		return 0;
 
-	if (sizeof(path) <= snprintf(path, sizeof(path), "%s/17", objdir)) {
-		warning(_("insanely long object directory %.*s"), 50, objdir);
-		return 0;
-	}
-	dir = opendir(path);
+	dir = opendir(git_path("objects/17"));
 	if (!dir)
 		return 0;
 
-	auto_threshold = (gc_auto_threshold + 255) / 256;
+	auto_threshold = DIV_ROUND_UP(gc_auto_threshold, 256);
 	while ((ent = readdir(dir)) != NULL) {
 		if (strspn(ent->d_name, "0123456789abcdef") != 38 ||
 		    ent->d_name[38] != '\0')
@@ -191,6 +198,11 @@ static void add_repack_all_option(void)
 	}
 }
 
+static void add_repack_incremental_option(void)
+{
+       argv_array_push(&repack, "--no-write-bitmap-index");
+}
+
 static int need_to_gc(void)
 {
 	/*
@@ -208,7 +220,9 @@ static int need_to_gc(void)
 	 */
 	if (too_many_packs())
 		add_repack_all_option();
-	else if (!too_many_loose_objects())
+	else if (too_many_loose_objects())
+		add_repack_incremental_option();
+	else
 		return 0;
 
 	if (run_hook_le(NULL, "pre-auto-gc", NULL))
@@ -220,7 +234,7 @@ static int need_to_gc(void)
 static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 {
 	static struct lock_file lock;
-	char my_host[128];
+	char my_host[HOST_NAME_MAX + 1];
 	struct strbuf sb = STRBUF_INIT;
 	struct stat st;
 	uintmax_t pid;
@@ -228,19 +242,23 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 	int fd;
 	char *pidfile_path;
 
-	if (is_tempfile_active(&pidfile))
+	if (is_tempfile_active(pidfile))
 		/* already locked */
 		return NULL;
 
-	if (gethostname(my_host, sizeof(my_host)))
+	if (xgethostname(my_host, sizeof(my_host)))
 		xsnprintf(my_host, sizeof(my_host), "unknown");
 
 	pidfile_path = git_pathdup("gc.pid");
 	fd = hold_lock_file_for_update(&lock, pidfile_path,
 				       LOCK_DIE_ON_ERROR);
 	if (!force) {
-		static char locking_host[128];
+		static char locking_host[HOST_NAME_MAX + 1];
+		static char *scan_fmt;
 		int should_exit;
+
+		if (!scan_fmt)
+			scan_fmt = xstrfmt("%s %%%ds", "%"SCNuMAX, HOST_NAME_MAX);
 		fp = fopen(pidfile_path, "r");
 		memset(locking_host, 0, sizeof(locking_host));
 		should_exit =
@@ -256,7 +274,7 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 			 * running.
 			 */
 			time(NULL) - st.st_mtime <= 12 * 3600 &&
-			fscanf(fp, "%"SCNuMAX" %127c", &pid, locking_host) == 2 &&
+			fscanf(fp, scan_fmt, &pid, locking_host) == 2 &&
 			/* be gentle to concurrent "gc" on remote hosts */
 			(strcmp(locking_host, my_host) || !kill(pid, 0) || errno == EPERM);
 		if (fp != NULL)
@@ -275,7 +293,7 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 	write_in_full(fd, sb.buf, sb.len);
 	strbuf_release(&sb);
 	commit_lock_file(&lock);
-	register_tempfile(&pidfile, pidfile_path);
+	pidfile = register_tempfile(pidfile_path);
 	free(pidfile_path);
 	return NULL;
 }
@@ -283,19 +301,34 @@ static const char *lock_repo_for_gc(int force, pid_t* ret_pid)
 static int report_last_gc_error(void)
 {
 	struct strbuf sb = STRBUF_INIT;
-	int ret;
+	int ret = 0;
+	struct stat st;
+	char *gc_log_path = git_pathdup("gc.log");
 
-	ret = strbuf_read_file(&sb, git_path("gc.log"), 0);
+	if (stat(gc_log_path, &st)) {
+		if (errno == ENOENT)
+			goto done;
+
+		ret = error_errno(_("Can't stat %s"), gc_log_path);
+		goto done;
+	}
+
+	if (st.st_mtime < gc_log_expire_time)
+		goto done;
+
+	ret = strbuf_read_file(&sb, gc_log_path, 0);
 	if (ret > 0)
-		return error(_("The last gc run reported the following. "
+		ret = error(_("The last gc run reported the following. "
 			       "Please correct the root cause\n"
 			       "and remove %s.\n"
 			       "Automatic cleanup will not be performed "
 			       "until the file is removed.\n\n"
 			       "%s"),
-			     git_path("gc.log"), sb.buf);
+			    gc_log_path, sb.buf);
 	strbuf_release(&sb);
-	return 0;
+done:
+	free(gc_log_path);
+	return ret;
 }
 
 static int gc_before_repack(void)
@@ -342,7 +375,10 @@ int cmd_gc(int argc, const char **argv, const char *prefix)
 	argv_array_pushl(&prune_worktrees, "worktree", "prune", "--expire", NULL);
 	argv_array_pushl(&rerere, "rerere", "gc", NULL);
 
+	/* default expiry time, overwritten in gc_config */
 	gc_config();
+	if (parse_expiry_date(gc_log_expire, &gc_log_expire_time))
+		die(_("Failed to parse gc.logexpiry value %s"), gc_log_expire);
 
 	if (pack_refs < 0)
 		pack_refs = !is_bare_repository();
@@ -379,8 +415,12 @@ int cmd_gc(int argc, const char **argv, const char *prefix)
 			if (report_last_gc_error())
 				return -1;
 
+			if (lock_repo_for_gc(force, &pid))
+				return 0;
 			if (gc_before_repack())
 				return -1;
+			delete_tempfile(&pidfile);
+
 			/*
 			 * failure to daemonize is ok, we'll continue
 			 * in foreground
@@ -440,6 +480,9 @@ int cmd_gc(int argc, const char **argv, const char *prefix)
 	if (auto_gc && too_many_loose_objects())
 		warning(_("There are too many unreachable loose objects; "
 			"run 'git prune' to remove them."));
+
+	if (!daemonized)
+		unlink(git_path("gc.log"));
 
 	return 0;
 }
